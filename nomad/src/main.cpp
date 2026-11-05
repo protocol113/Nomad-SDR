@@ -17,6 +17,7 @@
 extern "C" {
 #include "protocol.h"
 #include "stream_format.h"
+#include "ook.h"
 }
 
 #ifndef NOMAD_AP_SSID
@@ -466,6 +467,96 @@ static void hexAppend(String &s,const uint8_t *data,size_t n) {
     const char *digits="0123456789abcdef";
     for (size_t i=0;i<n;++i) { s+=digits[data[i]>>4]; s+=digits[data[i]&15]; }
 }
+// Wait until an absolute esp_timer deadline. Yield to the RTOS while far from
+// the deadline so Wi-Fi and the task watchdog keep running on long gaps; busy-
+// spin the final <3 ms so short OOK edges keep microsecond precision.
+static void ookWaitUntil(uint64_t deadline_us) {
+    for (;;) {
+        uint64_t t=now();
+        if (t>=deadline_us) return;
+        if (deadline_us-t>3000) vTaskDelay(1);
+    }
+}
+static void ookSetup(Radio &r,uint32_t freqHz,uint8_t pa[4],uint8_t power,uint8_t ramp,bool tx) {
+    uint8_t cmd[16],f1,f2;
+    transfer(r,cmd,nullptr,ook_cmd_standby(cmd,1)); ready(r,20);        // XOSC standby
+    if (ook_image_cal_band(freqHz,&f1,&f2)) { transfer(r,cmd,nullptr,ook_cmd_calibrate_image(cmd,f1,f2)); ready(r,50); }
+    transfer(r,cmd,nullptr,ook_cmd_set_frequency(cmd,freqHz)); ready(r,20);
+    transfer(r,cmd,nullptr,ook_cmd_pkt_type(cmd,1)); ready(r,20);        // GFSK base modem
+    if (tx) {
+        transfer(r,cmd,nullptr,ook_cmd_pa_config(cmd,pa)); ready(r,20);
+        transfer(r,cmd,nullptr,ook_cmd_tx_params(cmd,power,ramp)); ready(r,20);
+    }
+    transfer(r,cmd,nullptr,ook_cmd_standby(cmd,1)); ready(r,20);        // carrier guaranteed off
+}
+static void ookTransmit(Radio &r) {
+    request_t &q=r.req;
+    uint8_t cw[4],sb[4];
+    size_t nCw=ook_cmd_tx_cw(cw), nSb=ook_cmd_standby(sb,1);
+    BusLock lock;
+    if (!ready(r,20)) { failure(r,q.id,"busy_timeout","ook_setup"); return; }
+    // Key at the full 16 MHz SPI so a command frame is ~1 µs, not ~32 µs; this
+    // is the edge-timing floor. Restored before returning.
+    uint32_t savedSpeed=r.speed; r.speed=board::stream_spi;
+    ookSetup(r,q.ook_freq_hz,q.ook_pa,q.ook_power,q.ook_ramp,true);
+    uint64_t start=now(),sched=start,maxJit=0;
+    for (uint32_t rep=0;rep<q.ook_repeat;++rep) {
+        for (uint32_t i=0;i<q.ook_pulse_count;++i) {
+            // Even index = carrier on (SetTxCw), odd = off (SetStandby).
+            if (i&1) transfer(r,sb,nullptr,nSb); else transfer(r,cw,nullptr,nCw);
+            uint64_t issued=now(),jit=issued>sched?issued-sched:0;
+            if (jit>maxJit) maxJit=jit;
+            sched+=ook_pulse_at(q.tx,i);
+            ookWaitUntil(sched);
+        }
+        transfer(r,sb,nullptr,nSb);                 // off during the inter-burst gap
+        sched=now()+q.ook_gap_us;
+        ookWaitUntil(sched);
+    }
+    transfer(r,sb,nullptr,nSb); ready(r,20);        // final safety: carrier off
+    r.speed=savedSpeed;
+    r.io->printf("{\"id\":%lu,\"ok\":true,\"mode\":\"ook_tx\",\"freq_hz\":%lu,\"pulses\":%lu,\"repeats\":%lu,\"total_us\":%llu,\"max_edge_jitter_us\":%llu}\n",
+        (unsigned long)q.id,(unsigned long)q.ook_freq_hz,(unsigned long)q.ook_pulse_count,
+        (unsigned long)q.ook_repeat,(unsigned long long)(now()-start),(unsigned long long)maxJit);
+}
+static void ookReceive(Radio &r) {
+    request_t &q=r.req;
+    uint8_t cmd[16],rssi[2];
+    BusLock lock;
+    if (!ready(r,20)) { failure(r,q.id,"busy_timeout","ook_setup"); return; }
+    uint32_t savedSpeed=r.speed; r.speed=board::stream_spi; // fast RSSI polling
+    ookSetup(r,q.ook_freq_hz,q.ook_pa,0,0,false);
+    // Wide GFSK RX filter; the bw code sets the detection bandwidth, the rest
+    // are placeholders the envelope path does not depend on.
+    transfer(r,cmd,nullptr,ook_cmd_gfsk_mod(cmd,4800,0,(uint8_t)q.ook_bw,19000)); ready(r,20);
+    transfer(r,cmd,nullptr,ook_cmd_set_rx(cmd,0xffffff)); ready(r,20);  // continuous RX
+    String out; out.reserve(16384);
+    out="{\"id\":"+String((unsigned long)q.id)+",\"ok\":true,\"mode\":\"ook_rx\",\"freq_hz\":"+
+        String((unsigned long)q.ook_freq_hz)+",\"durations_us\":[";
+    uint64_t start=now(),endt=start+(uint64_t)q.ook_duration_ms*1000,prev=start,lastEdge=start;
+    uint64_t minPoll=UINT64_MAX,maxPoll=0;
+    uint32_t polls=0,edges=0; bool level=false,firstLevel=false,first=true;
+    while (now()<endt && edges<OOK_MAX_EDGES) {
+        transfer(r,cmd,nullptr,ook_cmd_get_rssi(cmd));
+        if (!ready(r,5)) break;
+        transfer(r,nullptr,rssi,2);                 // status + RSSI byte
+        int32_t rssiX2=-(int32_t)rssi[1];           // dBm*2; actual dBm = -rssi/2
+        bool lv=rssiX2>=q.ook_threshold_dbm_x2;      // carrier present above threshold
+        uint64_t t=now(),dp=t-prev; prev=t; ++polls;
+        if (dp<minPoll) minPoll=dp;
+        if (dp>maxPoll) maxPoll=dp;
+        if (first) { level=lv; firstLevel=lv; lastEdge=t; first=false; }
+        else if (lv!=level) { if (edges) out+=","; out+=String((unsigned long)(t-lastEdge)); lastEdge=t; level=lv; ++edges; }
+        if (q.ook_poll_us) ookWaitUntil(t+q.ook_poll_us);
+    }
+    transfer(r,cmd,nullptr,ook_cmd_standby(cmd,1)); ready(r,20);
+    r.speed=savedSpeed;
+    out+="],\"first_level\":"+String(firstLevel?1:0)+",\"edges\":"+String((unsigned long)edges)+
+         ",\"polls\":"+String((unsigned long)polls)+",\"poll_min_us\":"+
+         String((unsigned long)(minPoll==UINT64_MAX?0:minPoll))+",\"poll_max_us\":"+
+         String((unsigned long)maxPoll)+",\"truncated\":"+String(edges>=OOK_MAX_EDGES?"true":"false")+"}\n";
+    r.io->write(reinterpret_cast<const uint8_t *>(out.c_str()),out.length());
+}
 static void stream(Radio &r) {
     request_t &q=r.req;
     r.packed=q.command==CMD_PACKED;
@@ -573,8 +664,87 @@ static void stream(Radio &r) {
     if (connected && !sendBytes(r,end,sizeof(end))) connected=false;
     if (!connected) r.client.stop();
 }
+static bool hexToBytes(const char *s,uint8_t *out,size_t cap,size_t *n) {
+    size_t len=strlen(s);
+    if ((len&1) || len/2>cap) return false;
+    for (size_t i=0;i<len;++i) {
+        char c=s[i]; int v=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1;
+        if (v<0) return false;
+        if (!(i&1)) out[i/2]=uint8_t(v<<4); else out[i/2]|=uint8_t(v);
+    }
+    *n=len/2; return true;
+}
+static bool parseU32(const char *s,uint32_t lo,uint32_t hi,uint32_t *out) {
+    if (!s || !*s) return false;
+    char *end; unsigned long v=strtoul(s,&end,10);
+    if (*end || v<lo || v>hi) return false;
+    *out=uint32_t(v); return true;
+}
+// ESP32-only OOK commands, parsed ahead of the shared parse_request so the Pico
+// grammar is untouched. ooktx keys a carrier; ookrx recovers an RSSI envelope.
+static bool parseOok(char *line,request_t *req,const char **error) {
+    const char *p=line; char tok[64];
+    if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,1,UINT32_MAX,&req->id)) return false;
+    if (!nextToken(p,tok,sizeof(tok))) return false;
+    bool tx=!strcmp(tok,"ooktx"), rx=!strcmp(tok,"ookrx");
+    if (!tx && !rx) return false;
+    uint32_t id=req->id; memset(req,0,sizeof(*req)); req->id=id;
+    // Full synthesizer span; hardware rejects anything its matching cannot pass.
+    if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,150000000u,2500000000u,&req->ook_freq_hz)) {
+        *error="ook_freq_150M_to_2500M"; return false;
+    }
+    if (tx) {
+        req->command=CMD_OOKTX;
+        char paname[8]; if (!nextToken(p,paname,sizeof(paname))) { *error="ook_pa"; return false; }
+        int pi=ook_pa_index(paname);
+        if (pi<0) { *error="ook_pa_lp_hp_hf"; return false; }
+        const ook_pa_profile_t *prof=ook_pa_profile((unsigned)pi);
+        memcpy(req->ook_pa,prof->config,4);
+        if (!nextToken(p,tok,sizeof(tok))) { *error="ook_power"; return false; }
+        char *end; long power=strtol(tok,&end,10);
+        if (*end || power<prof->min_dbm || power>prof->max_dbm) { *error="ook_power_out_of_pa_range"; return false; }
+        req->ook_power=uint8_t(power&0xff);
+        uint32_t ramp; if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,0,15,&ramp)) { *error="ook_ramp_0_to_15"; return false; }
+        req->ook_ramp=uint8_t(ramp);
+        if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,1,10000,&req->ook_repeat)) { *error="ook_repeat_1_to_10000"; return false; }
+        if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,0,OOK_MAX_PULSE_US,&req->ook_gap_us)) { *error="ook_gap_0_to_32768"; return false; }
+        char pulses[2*OOK_MAX_PULSES+1]; size_t nbytes;
+        if (!nextToken(p,pulses,sizeof(pulses)) || !hexToBytes(pulses,req->tx,BRIDGE_MAX_BYTES,&nbytes) ||
+            (nbytes&1) || nbytes<2) { *error="ook_pulses_hex_be16"; return false; }
+        req->ook_pulse_count=uint32_t(nbytes/2);
+        // Bound total on-air time; reject a pulse of zero or over the ceiling.
+        uint64_t one=0;
+        for (uint32_t i=0;i<req->ook_pulse_count;++i) {
+            uint16_t d=ook_pulse_at(req->tx,i);
+            if (d==0 || d>OOK_MAX_PULSE_US) { *error="ook_pulse_1_to_32768_us"; return false; }
+            one+=d;
+        }
+        if ((one+req->ook_gap_us)*req->ook_repeat>OOK_MAX_TX_TOTAL_US) { *error="ook_total_tx_time_over_2s"; return false; }
+        if (nextToken(p,tok,sizeof(tok))) { *error="ook_trailing_token"; return false; }
+        return true;
+    }
+    req->command=CMD_OOKRX;
+    if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,0,31,&req->ook_bw)) { *error="ook_bw_code_0_to_31"; return false; }
+    if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,1,OOK_MAX_RX_MS,&req->ook_duration_ms)) { *error="ook_duration_1_to_30000_ms"; return false; }
+    if (!nextToken(p,tok,sizeof(tok))) { *error="ook_threshold"; return false; }
+    char *end; long thr=strtol(tok,&end,10);
+    if (*end || thr>0 || thr<-400) { *error="ook_threshold_dbm_x2_-400_to_0"; return false; }
+    req->ook_threshold_dbm_x2=int32_t(thr);
+    if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,OOK_MIN_POLL_US,100000,&req->ook_poll_us)) { *error="ook_poll_5_to_100000_us"; return false; }
+    // RX reuses the LP PA slot for setup symmetry; it is not keyed in RX.
+    memcpy(req->ook_pa,ook_pa_profile(0)->config,4);
+    if (nextToken(p,tok,sizeof(tok))) { *error="ook_trailing_token"; return false; }
+    return true;
+}
 static bool parseNomadRequest(char *line,request_t *req,bool *compact,bool *decimated,const char **error) {
     *compact=false;*decimated=false;
+    {
+        unsigned long pid=0; char pcmd[16];
+        if (sscanf(line,"%lu %15s",&pid,pcmd)==2 && (!strcmp(pcmd,"ooktx")||!strcmp(pcmd,"ookrx"))) {
+            *error="ook_syntax";
+            return parseOok(line,req,error);
+        }
+    }
     unsigned long id=0,rate=0,blocks=0;
     char command[16],extra;
     if(sscanf(line,"%lu %15s",&id,command)==2 && (!strcmp(command,"streamp8") || !strcmp(command,"streampd"))) {
@@ -626,6 +796,8 @@ static void request(Radio &r) {
         if (!ready(r,q.timeout_ms)) { failure(r,q.id,"busy_timeout","wait"); return; }
         break;
     case CMD_STREAM: case CMD_STREAM2: case CMD_PACKED: stream(r); return;
+    case CMD_OOKTX: ookTransmit(r); return;
+    case CMD_OOKRX: ookReceive(r); return;
     case CMD_READ: case CMD_WRITE: case CMD_XFER: {
         String out; out.reserve(2*(q.tx_len+q.read_len)+200);
         uint8_t *cmdRx=static_cast<uint8_t *>(malloc(q.tx_len));
