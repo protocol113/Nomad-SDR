@@ -1,6 +1,9 @@
 # RadioMaster XR4 SDR port
 
-Status: **builds and passes offline tests; not yet run on XR4 hardware.**
+Status: **running on XR4 hardware (2026-11-05).** Both radios stream over UART
+with zero lost samples (radio 0 at 915 MHz, radio 1 at 2440 MHz, 3 s captures,
+31.25 kS/s LID8). Sensitivity, dual-radio Wi-Fi streaming and power draw are
+not yet measured.
 
 The XR4 (Gemini Xrossband true-diversity receiver) carries the same ESP32 and
 two LR1121 chips as the Nomad, on the same SPI bus. This port reuses the Nomad
@@ -67,8 +70,37 @@ Restore ExpressLRS: repeat step 1, then
 `python -m esptool --chip esp32 --port PORT write_flash 0x0 xr4-elrs-backup.bin`,
 or flash the XR4 target with the ExpressLRS Configurator over UART.
 
-Flashing through the ExpressLRS Wi-Fi updater or Betaflight passthrough is
-untested; use the pads.
+Flashing through Betaflight `serialpassthrough` (FC UART2) **did not work** on
+the tested unit: passthrough opened and the old firmware answered through it, but
+the ESP32 ROM bootloader never replied to esptool. A direct CP2102 adapter on
+the pads worked first time. Disconnect the FC from the RX/TX pads while flashing.
+The tested unit is an ESP32-PICO-D4 (rev 1.1) with 4 MB flash. esptool cannot
+reset it over RTS, so power-cycle the adapter (without the button) after flashing.
+
+## Convert the LR1121 chips to stock 1.3 (required once)
+
+The XR4 ships with Semtech's ExpressLRS build **F30104** (`22f30104`) on both
+LR1121 chips. The SDR needs stock **1.3** (`22030103`): it installs its sample
+ring at RAM addresses and checks a layout guard taken from 1.3. On F30104 the RX
+DMA descriptors match but the guard word at `0x800498` reads `0x0006` instead
+of `0x0104`, so streaming refuses (nothing is written). Convert each chip with
+the application-only installer. It checks bootloader `22df2100` before erasing
+and never touches the bootloader:
+
+```sh
+python lr1121/install.py stock --port PORT --radio 0 --out build/xr4-radio0
+python lr1121/install.py stock --port PORT --radio 1 --out build/xr4-radio1
+```
+
+Restore F30104 (before going back to ExpressLRS) from the checksum-pinned image
+in the Semtech submodule:
+
+```sh
+mkdir -p build/backups
+cp external/radio-firmware-images/lr1121/transceiver_drone/lr1121_transceiver_F30104.bin build/backups/lr1121-elrs-f30104.bin
+python lr1121/install.py restore-elrs --port PORT --radio 0 --out build/xr4-radio0
+python lr1121/install.py restore-elrs --port PORT --radio 1 --out build/xr4-radio1
+```
 
 ## Use
 
@@ -85,6 +117,9 @@ The `fan` command reports `"fan":"none"`. `led INDEX R G B` accepts only index 0
 - Which antenna connector and band each LR1121 serves on the XR4, and the exact
   function of switch bit 0x08. The table comes from ELRS, which receives on the
   board with it, but SDR sensitivity per band is unmeasured.
+- Whether F30104 could stream if the `0x800498` guard were relaxed (its RAM
+  map is unverified; not pursued, because 1.3 works and nothing on the SDR uses
+  F30104 features).
 - TCXO/LF clock: the XR4 target, like the Nomad, has no override, so none is sent.
 - Power draw and thermals without a fan. The ESP32 runs at 240 MHz with Wi-Fi
   power-save disabled, as on the Nomad.
