@@ -31,7 +31,7 @@ Firmware on the Nomad's main ESP32 turns the stock dual-LR1121 Gemini board into
 9. [Common problems](#common-problems)
 10. [Limits](#limits)
 
-More detail: [USB native](docs/usb-native.md) · [live SDR](docs/live-sdr.md) · [control API](docs/control-api.md) · [Nomad](docs/nomad.md)
+More detail: [USB native](docs/usb-native.md) · [live SDR](docs/live-sdr.md) · [control API](docs/control-api.md) · [Nomad](docs/nomad.md) · [XR4 port](docs/xr4.md)
 
 ---
 

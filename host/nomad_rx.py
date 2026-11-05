@@ -21,6 +21,7 @@ import zlib
 from bridge import Bridge, BridgeError
 from lr1121 import RadioError
 from frequency import valid_frequency, receiver_band
+from boards import BoardError, rf_switch_command
 
 HEADER = struct.Struct('<4sBBH9I')
 CONTROL = 0x9FE3E7A7
@@ -57,8 +58,12 @@ class NomadReceiver:
         if rate not in RATES:
             raise ValueError('Nomad rate must be 62500 or 125000')
         info = self.b.info()
-        if info.get('board') != 'radiomaster-nomad' or info.get('radio') not in (0, 1):
-            raise RadioError('Expected a RadioMaster Nomad bridge', info)
+        try:
+            rf_switch = rf_switch_command(info)
+        except BoardError as error:
+            raise RadioError(str(error), info) from None
+        if info.get('radio') not in (0, 1):
+            raise RadioError('Expected a dual-LR1121 bridge radio 0 or 1', info)
         version = self.b.version()
         if version.get('data') != '22030103':
             raise RadioError('SDR requires stock LR1121 transceiver 1.3 (22030103); '
@@ -67,9 +72,9 @@ class NomadReceiver:
         self.b.reset()
         self.write('011c00', 1)
         self.write('011001', 1)
-        # Nomad/ELRS default switch table, NOT the Waveshare board's table.
-        # No TCXO or external 32 kHz clock setup: absent in the Nomad target.
-        self.write('01120f00040808020001', 1)
+        # Per-board ELRS switch table (host/boards.py), NOT the Waveshare one.
+        # No TCXO or external 32 kHz clock setup: absent in Nomad and XR4 targets.
+        self.write(rf_switch, 1)
         self.write('010e', 1)
         self.write('010f3f', 1)
         self.write('011400800000', 1)

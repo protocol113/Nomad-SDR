@@ -109,7 +109,7 @@ static void saveWifiCredentials() {
 }
 static void startNetwork() {
     WiFi.persistent(false);
-    WiFi.setHostname("nomad-sdr");
+    WiFi.setHostname(board::hostname);
     WiFi.setSleep(false);
     if (staEnabled()) {
         WiFi.mode(WIFI_STA);
@@ -248,7 +248,7 @@ static bool telemetryRequest(const char *line,Print &out,uint32_t id) {
     char command[16]={0},action[16]={0},extra;
     int n=sscanf(line,"%*u %15s %15s %c",command,action,&extra);
     if(n==1 && !strcmp(command,"capabilities")) {
-        out.printf("{\"id\":%lu,\"ok\":true,\"schema\":1,\"board\":\"radiomaster-nomad\",\"radios\":2,\"frequency_hz\":[150000000,2500000000],\"native_rates\":[62500,125000],\"streams\":[\"LIQ1\",\"LIQ8\",\"LID8\"],\"packed_requires_per_chip_verification\":true,\"packed_extension_probed\":false,\"usb_live_native_rate\":62500,\"usb_live_output_rate\":31250,\"uart_baud\":%lu,\"packed_usb_burst_max_banks\":128,\"fan\":true,\"rgb_leds\":2,\"control_api\":\"host/nomad_api.py\"}\n",(unsigned long)id,(unsigned long)board::uart_baud);
+        out.printf("{\"id\":%lu,\"ok\":true,\"schema\":1,\"board\":\"%s\",\"rf_switch\":\"%s\",\"radios\":2,\"frequency_hz\":[150000000,2500000000],\"native_rates\":[62500,125000],\"streams\":[\"LIQ1\",\"LIQ8\",\"LID8\"],\"packed_requires_per_chip_verification\":true,\"packed_extension_probed\":false,\"usb_live_native_rate\":62500,\"usb_live_output_rate\":31250,\"uart_baud\":%lu,\"packed_usb_burst_max_banks\":128,\"fan\":%s,\"rgb_leds\":%u,\"control_api\":\"host/nomad_api.py\"}\n",(unsigned long)id,board::name,board::rf_switch,(unsigned long)board::uart_baud,board::has_fan?"true":"false",board::led_count);
         return true;
     }
     if(n!=2 || strcmp(command,"stream") || strcmp(action,"status"))return false;
@@ -608,8 +608,8 @@ static void request(Radio &r) {
     request_t &q=r.req;
     switch(q.command) {
     case CMD_INFO:
-        r.io->printf("{\"id\":%lu,\"ok\":true,\"bridge\":\"lr1121-spi\",\"protocol\":1,\"firmware\":\"nomad-0.11.0\",\"board\":\"radiomaster-nomad\",\"radio\":%u,\"radios\":2,\"stream\":\"LIQ1\",\"compact_stream\":\"LIQ8\",\"decimated_stream\":\"LID8\",\"transport\":\"%s\",\"uart_baud\":%lu,\"usb_compact_stream\":true,\"experimental_packed_stream\":true,\"serial_capture_max_blocks\":%u,\"spi_hz\":%lu,\"max_bytes\":4096,\"reset_guard\":0,\"pins\":{\"sck\":25,\"miso\":33,\"mosi\":32,\"cs\":%d,\"busy\":%d,\"reset\":%d,\"dio9\":%d,\"fan\":%d,\"led_rgb\":%d,\"led_count\":%u}}\n",
-            (unsigned long)q.id,r.index,r.serialSession?"uart":"tcp",(unsigned long)board::uart_baud,r.serialSession?32u:0u,(unsigned long)r.speed,board::cs[r.index],board::busy[r.index],board::reset[r.index],board::dio9[r.index],board::fan,board::led,board::led_count); return;
+        r.io->printf("{\"id\":%lu,\"ok\":true,\"bridge\":\"lr1121-spi\",\"protocol\":1,\"firmware\":\"nomad-0.11.0\",\"board\":\"%s\",\"rf_switch\":\"%s\",\"radio\":%u,\"radios\":2,\"stream\":\"LIQ1\",\"compact_stream\":\"LIQ8\",\"decimated_stream\":\"LID8\",\"transport\":\"%s\",\"uart_baud\":%lu,\"usb_compact_stream\":true,\"experimental_packed_stream\":true,\"serial_capture_max_blocks\":%u,\"spi_hz\":%lu,\"max_bytes\":4096,\"reset_guard\":0,\"pins\":{\"sck\":25,\"miso\":33,\"mosi\":32,\"cs\":%d,\"busy\":%d,\"reset\":%d,\"dio9\":%d,\"fan\":%d,\"led_rgb\":%d,\"led_count\":%u}}\n",
+            (unsigned long)q.id,board::name,board::rf_switch,r.index,r.serialSession?"uart":"tcp",(unsigned long)board::uart_baud,r.serialSession?32u:0u,(unsigned long)r.speed,board::cs[r.index],board::busy[r.index],board::reset[r.index],board::dio9[r.index],board::fan,board::led,board::led_count); return;
     case CMD_PINS:
         r.io->printf("{\"id\":%lu,\"ok\":true,\"cs\":%d,\"reset\":%d,\"busy\":%d,\"dio9\":%d}\n",(unsigned long)q.id,
             digitalRead(board::cs[r.index]),digitalRead(board::reset[r.index]),digitalRead(board::busy[r.index]),digitalRead(board::dio9[r.index])); return;
@@ -700,8 +700,9 @@ void setup() {
     if (!spiMutex || !streamMutex) abort();
     // Keep the external PA control at zero; hold backpack in reset so its
     // original ELRS auxiliary firmware cannot interfere with this experiment.
-    pinMode(board::pa_apc,OUTPUT); digitalWrite(board::pa_apc,LOW);
-    pinMode(board::backpack_en,OUTPUT); digitalWrite(board::backpack_en,LOW);
+    // Boards without these pins (XR4) use -1; GPIO26 there is radio 0 RESET.
+    if (board::pa_apc>=0) { pinMode(board::pa_apc,OUTPUT); digitalWrite(board::pa_apc,LOW); }
+    if (board::backpack_en>=0) { pinMode(board::backpack_en,OUTPUT); digitalWrite(board::backpack_en,LOW); }
     indicatorsBegin();
     for (unsigned i=0;i<2;++i) {
         Radio &r=radios[i]; r.index=i;
@@ -725,7 +726,7 @@ void setup() {
         if (xTaskCreatePinnedToCore(serve,i?"radio1":"radio0",8192,&radios[i],2,nullptr,0)!=pdPASS) abort();
     }
     if (xTaskCreatePinnedToCore(acquire,"acquire",4096,nullptr,3,nullptr,1)!=pdPASS) abort();
-    Serial.printf("Nomad SDR: %s mode, TCP 1121 / 1122; use '<id> wifi' for IP/status\n",staEnabled()?"STA":"AP");
+    Serial.printf("%s SDR: %s mode, TCP 1121 / 1122; use '<id> wifi' for IP/status\n",board::name,staEnabled()?"STA":"AP");
 }
 void loop() {
     networkTick();

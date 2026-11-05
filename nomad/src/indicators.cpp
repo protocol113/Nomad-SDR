@@ -4,6 +4,7 @@
 #include "driver/rmt.h"
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 extern "C" {
 #include "stream_format.h"
 }
@@ -25,8 +26,12 @@ constexpr uint32_t kErrorBits = IQ_DMA_STARVED | IQ_QUEUE_FULL | IQ_RADIO_ERROR 
 
 FanMode fanMode = FanMode::Auto;
 LedMode ledMode = LedMode::Auto;
-LedState ledState[board::led_count] = {LedState::Ready, LedState::Ready};
-uint8_t ledRgb[board::led_count][3] = {{0, 0, 0}, {0, 0, 0}};
+// One logical status per radio. Boards with a single pixel (XR4) show the
+// more severe of the two; LedState is ordered by severity.
+constexpr unsigned kLogicalLeds = 2;
+static_assert(board::led_count >= 1 && board::led_count <= kLogicalLeds, "led_count");
+LedState ledState[kLogicalLeds] = {LedState::Ready, LedState::Ready};
+uint8_t ledRgb[kLogicalLeds][3] = {{0, 0, 0}, {0, 0, 0}};
 bool fanOutput = false;
 bool ledReady = false;
 float tempC = 0;
@@ -97,6 +102,7 @@ LedState radioLed(bool active, uint32_t flags, unsigned queued, unsigned capacit
 }
 
 void applyFan(bool on) {
+    if (!board::has_fan) return;
     if (fanOutput == on) return;
     fanOutput = on;
     digitalWrite(board::fan, on ? HIGH : LOW);
@@ -119,11 +125,14 @@ void applyAutoFan() {
 
 void applyAutoLeds() {
     if (ledMode != LedMode::Auto) return;
-    uint8_t next[board::led_count][3];
+    uint8_t next[kLogicalLeds][3];
     bool changed = false;
-    for (unsigned i = 0; i < board::led_count; ++i) {
+    for (unsigned i = 0; i < kLogicalLeds; ++i)
         ledState[i] = radioLed(radioActive[i], radioFlags[i], radioQueued[i], radioCapacity[i]);
-        colorFor(ledState[i], next[i]);
+    for (unsigned i = 0; i < board::led_count; ++i) {
+        LedState shown = ledState[i];
+        if (board::led_count == 1) shown = std::max(ledState[0], ledState[1]);
+        colorFor(shown, next[i]);
         if (ledRgb[i][0] != next[i][0] || ledRgb[i][1] != next[i][1] || ledRgb[i][2] != next[i][2])
             changed = true;
     }
@@ -134,7 +143,7 @@ void applyAutoLeds() {
 }
 
 void jsonStatus(Print &out, uint32_t id) {
-    const char *fanName = fanMode == FanMode::Off ? "off" : fanMode == FanMode::Auto ? "auto" : "on";
+    const char *fanName = !board::has_fan ? "none" : fanMode == FanMode::Off ? "off" : fanMode == FanMode::Auto ? "auto" : "on";
     int tempTenths = int(tempC * 10.0f);
     out.printf("{\"id\":%lu,\"ok\":true,\"fan\":\"%s\",\"fan_on\":%s,\"temp_c\":%d.%d,\"fan_on_c\":%d,\"fan_off_c\":%d,\"led\":\"%s\",\"led_count\":%u,\"led_pin\":%d,\"led_order\":\"grb\",\"brightness\":%u,\"states\":[\"%s\",\"%s\"],\"pixels\":[[%u,%u,%u],[%u,%u,%u]]}\n",
         (unsigned long)id, fanName, fanOutput ? "true" : "false",
@@ -147,7 +156,7 @@ void jsonStatus(Print &out, uint32_t id) {
 }
 
 void indicatorsBegin() {
-    pinMode(board::fan, OUTPUT);
+    if (board::has_fan) pinMode(board::fan, OUTPUT);
     fanMode = FanMode::Auto;
     ledMode = LedMode::Auto;
     rmt_config_t config = {};

@@ -12,7 +12,10 @@ Import('env')
 def package(source, target, env):
     root = Path(env.subst('$PROJECT_DIR')).parent
     build = Path(env.subst('$BUILD_DIR'))
-    out = root / 'dist' / 'nomad'
+    pioenv = env.subst('$PIOENV')
+    board = {'radiomaster_nomad': 'radiomaster-nomad', 'radiomaster_xr4': 'radiomaster-xr4'}[pioenv]
+    # Keep the Nomad path unchanged for existing docs/tools; other boards get their own folder.
+    out = root / 'dist' / ('nomad' if pioenv == 'radiomaster_nomad' else board.split('-', 1)[1])
     out.mkdir(parents=True, exist_ok=True)
     platform = env.PioPlatform()
     framework = Path(platform.get_package_dir('framework-arduinoespressif32'))
@@ -32,7 +35,7 @@ def package(source, target, env):
     shutil.copy2(root / 'docs' / 'nomad.md', out / 'nomad.md')
     shutil.copy2(root / 'docs' / 'live-sdr.md', out / 'live-sdr.md')
     shutil.copy2(root / 'docs' / 'handover.md', out / 'handover.md')
-    manifest = dict(board='radiomaster-nomad', mcu='esp32', hardware_validated=False,
+    manifest = dict(board=board, mcu='esp32', hardware_validated=False,
                     merged_flash_offset='0x0', application_flash_offset='0x10000',
                     lr1121_firmware_included=False, files={})
     for name in ('nomad-sdr-merged.bin', 'firmware.bin', 'bootloader.bin', 'partitions.bin', 'boot_app0.bin'):

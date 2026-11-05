@@ -55,8 +55,8 @@ class Core1121:
         """Reset and configure the board, ending in verified crystal standby."""
         self.steps = []
         info = self.bridge.info()
-        if info.get('board') == 'radiomaster-nomad':
-            raise RadioError('Core1121 is a Waveshare profile; use host/nomad_rx.py for Nomad', info)
+        if str(info.get('board', '')).startswith('radiomaster-'):
+            raise RadioError('Core1121 is a Waveshare profile; use host/nomad_rx.py for Nomad/XR4', info)
         report = dict(bridge=info, version=self.bridge.version(),
                       errors_before_reset=self.bridge.errors(), steps=self.steps)
         if not report["version"]["version"]["is_lr1121_transceiver"]:
