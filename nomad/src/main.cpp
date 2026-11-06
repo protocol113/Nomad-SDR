@@ -11,6 +11,12 @@
 #include "soc/gpio_struct.h"
 #include "rom/ets_sys.h"
 #include "lwip/opt.h"
+#include "lwip/api.h"
+#include "lwip/tcp.h"
+#include "lwip/tcpip.h"
+extern "C" {
+#include "lwip/priv/sockets_priv.h"
+}
 #include "board.h"
 #include "compact.h"
 #include "indicators.h"
@@ -176,6 +182,7 @@ struct Radio {
     uint64_t elapsed=0;
     // Parser options also change for ordinary RPCs. Keep the last accepted
     // stream's format separately so info/read requests do not corrupt telemetry.
+    bool sendBufferGrown=false; // Once per TCP connection; reset on accept.
     bool streamCompact=false,streamDecimated=false,streamPacked=false;
     uint32_t streamRate=0;
     uint64_t start, deadline;
@@ -505,6 +512,31 @@ static void acquire(void *) {
         if (!work || now()-lastYield>=10000) { vTaskDelay(1); lastYield=now(); }
     }
 }
+// The Arduino lwIP build fixes TCP_SND_BUF at 5760 B (4 segments). On a weak
+// XR4 link a lost segment then rarely draws 3 duplicate ACKs, so recovery waits
+// for the retransmission timer (>= ~0.5 s) and a dual stream's send queue fills
+// (measured: 60 s dual runs ended at 33-46 s at -73 dBm). snd_buf counts free
+// send space; raising it once on an idle connection lets ~12 segments fly.
+// Done inside the tcpip thread; TCP_SND_QUEUELEN (17 pbufs) still caps it.
+struct GrowSend { int fd; SemaphoreHandle_t done; bool ok; };
+static void growSendInTcpip(void *arg) {
+    GrowSend &g=*static_cast<GrowSend *>(arg);
+    struct lwip_sock *sock=lwip_socket_dbg_get_socket(g.fd);
+    if (sock && sock->conn && NETCONNTYPE_GROUP(sock->conn->type)==NETCONN_TCP && sock->conn->pcb.tcp &&
+        sock->conn->pcb.tcp->snd_buf==TCP_SND_BUF) { // Idle: nothing queued.
+        sock->conn->pcb.tcp->snd_buf=TCP_SND_BUF*3;
+        g.ok=true;
+    }
+    xSemaphoreGive(g.done);
+}
+static void growSendBuffer(Radio &r) {
+    if (r.serialSession || r.sendBufferGrown || r.client.fd()<0) return;
+    static StaticSemaphore_t storage;
+    static SemaphoreHandle_t done=xSemaphoreCreateBinaryStatic(&storage);
+    GrowSend g{r.client.fd(),done,false};
+    if (tcpip_callback(growSendInTcpip,&g)==ERR_OK && xSemaphoreTake(done,pdMS_TO_TICKS(100))==pdTRUE)
+        r.sendBufferGrown=g.ok;
+}
 static bool sendBytes(Radio &r,const uint8_t *p,size_t n) {
     uint64_t until=now()+2000000;
     while (n) {
@@ -648,8 +680,9 @@ static void stream(Radio &r) {
     r.sent.store(0);r.elapsed=0;
     r.streamCompact=r.compact;r.streamDecimated=r.decimated;r.streamPacked=r.packed;r.streamRate=r.rate;
     r.start=0; r.stop.store(false); r.done.store(false);
-    r.io->printf("{\"id\":%lu,\"ok\":true,\"stream\":\"%s\",\"format\":\"%s\",\"acquisition\":\"%s\",\"header_bytes\":44,\"samples_per_frame\":%u,\"native_samples_per_frame\":125,\"decimation\":%u,\"blocks\":%lu}\n",
-        (unsigned long)q.id,r.decimated?"LID8":r.compact?"LIQ8":"LIQ1",r.compact?"iq8_block_float":"iq23le",r.packed?"arc8":"raw23",r.decimated?0u:125u,r.decimated?2u:1u,(unsigned long)r.blocks);
+    growSendBuffer(r);
+    r.io->printf("{\"id\":%lu,\"ok\":true,\"stream\":\"%s\",\"format\":\"%s\",\"acquisition\":\"%s\",\"header_bytes\":44,\"samples_per_frame\":%u,\"native_samples_per_frame\":125,\"decimation\":%u,\"blocks\":%lu,\"tcp_send_buffer\":%u}\n",
+        (unsigned long)q.id,r.decimated?"LID8":r.compact?"LIQ8":"LIQ1",r.compact?"iq8_block_float":"iq23le",r.packed?"arc8":"raw23",r.decimated?0u:125u,r.decimated?2u:1u,(unsigned long)r.blocks,r.serialSession?0u:unsigned(TCP_SND_BUF*(r.sendBufferGrown?3:1)));
     r.active.store(true);
     xSemaphoreGive(streamMutex);
     Frame frame;
@@ -885,7 +918,7 @@ static void request(Radio &r) {
 static void serve(void *arg) {
     Radio &r=*static_cast<Radio *>(arg);
     for (;;) {
-        r.client=servers[r.index].available();
+        r.client=servers[r.index].available(); r.sendBufferGrown=false;
         if (!r.client) { delay(10); continue; }
         if (xSemaphoreTake(r.owner,0)!=pdTRUE) { r.client.stop(); continue; }
         r.io=&r.client; r.serialSession=false;

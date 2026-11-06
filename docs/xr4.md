@@ -2,9 +2,10 @@
 
 Status: **running on XR4 hardware (2026-11-05).** Each radio streams over UART
 or Wi-Fi with zero lost samples. Both radios stream **at the same time** over
-Wi-Fi in narrow mode (31.25 kS/s each, see below): live feeds 15 s and
-recordings 10 s with zero loss; 60 s depends on Wi-Fi signal (below).
-Sensitivity and power draw are not yet measured.
+Wi-Fi in narrow mode (31.25 kS/s each, see below): two 60 s recordings (radio 0
+at 915 MHz, radio 1 at 2440 MHz) and 15 s of two live feeds, all with zero lost
+samples, at a weak -74 dBm Wi-Fi signal. Sensitivity and power draw are not yet
+measured.
 
 The XR4 (Gemini Xrossband true-diversity receiver) carries the same ESP32 and
 two LR1121 chips as the Nomad, on the same SPI bus. This port reuses the Nomad
@@ -147,12 +148,15 @@ about 53% of the budget.
 
 Serial (UART) carries one radio: 921600 baud fits one 31.25 kS/s stream.
 
-**Wi-Fi signal decides long dual sessions.** Two feeds need about 150 kB/s;
-the XR4 measured about 250 kB/s total over TCP at -73 dBm, and the two
-connections do not share it evenly. Slow patches longer than the ~415 ms send
-buffer per radio end a stream with `flags: 2` (queue full). Place the XR4 for
--60 dBm or better (`bridge.py ... wifi` reports `rssi_dbm`). The 2.4 GHz band
-is the only one the ESP32 joins.
+**Wi-Fi.** Two feeds need about 150 kB/s; the XR4 measured about 250 kB/s total
+over TCP at -73 dBm. The Arduino lwIP build fixes the TCP send buffer at 5760 B
+(4 segments): on a weak link a lost segment then waits for the retransmission
+timer, and 60 s dual runs ended at 33-46 s with `flags: 2` (send queue full).
+The firmware now raises each streaming connection's lwIP `snd_buf` to 3x
+(17280 B, about 12 segments; the stream acknowledgement reports
+`tcp_send_buffer`). With that, two 60 s dual runs at -74 dBm peaked at 3-27 of
+83 queued frames per radio. Better placement still adds margin
+(`bridge.py ... wifi` reports `rssi_dbm`); the ESP32 joins 2.4 GHz only.
 
 ## Update firmware without the boot button
 
@@ -190,8 +194,9 @@ the XR4 (firmware with the IRAM SPI path):
 | Native 31.25 kS/s (narrow) | 4 ms | 1068 / 1223 us | 717 us |
 
 Keep idle free heap above about 60 KB. Below that the ESP32 dropped full-size
-Wi-Fi packets (100% loss on 1400-byte pings) and TCP stalled; the send queues
-are sized to leave about 80 KB.
+Wi-Fi packets (100% loss on 1400-byte pings) and TCP stalled. The send queues
+(32 frames per radio) leave about 92 KB idle; during the 60 s dual runs the
+minimum was about 52 KB with Wi-Fi unaffected.
 
 ## Not yet verified on hardware
 
