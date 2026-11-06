@@ -68,19 +68,23 @@ class Settings:
 
 
 class ClientSession:
-    def __init__(self, client, host, radio, frequency, output_rate, gain_db, report=None,stream_rate=31250,buffer_ms=250,serial=None,packed_verification=None):
+    def __init__(self, client, host, radio, frequency, output_rate, gain_db, report=None,stream_rate=31250,buffer_ms=250,serial=None,packed_verification=None,narrow=False):
         self.client, self.host, self.radio = client, host, radio
         self.serial = serial
         self.packed_verification = packed_verification
         self.gain_db, self.report_path = gain_db, report
         self.stream_rate,self.buffer_ms=stream_rate,buffer_ms
+        # Narrow: the LR1121 itself delivers 31.25 kS/s (BW 0x0E, ~11 kHz usable),
+        # one 125-sample bank per 4 ms. Half the SPI load: needed for two radios.
+        self.narrow=narrow
+        self.bank_ms=4 if narrow else 2
         self.settings = Settings(frequency, output_rate)
         self.lock = threading.Lock()
         self.generation = 0
         self.stop = threading.Event()
         self.last_change = time.monotonic()
         self.stats = dict(host=host, radio=radio, native_rate=NATIVE_RATE, gain_db=gain_db,
-                          stream_rate=stream_rate,buffer_ms=buffer_ms,underruns=0,
+                          stream_rate=stream_rate,buffer_ms=buffer_ms,narrow=narrow,underruns=0,
                           clients=1, connected=True, jobs=[], received_frames=0, forwarded_samples=0, error=None)
         self.ignored = set()
 
@@ -187,7 +191,7 @@ class ClientSession:
             except Exception as exc:errors.append(exc)
             finally:finished.set()
         reader=threading.Thread(target=receive,name='nomad-iq',daemon=True);reader.start()
-        prefill=max(1,round(self.buffer_ms/2)) # Every bank spans 2 ms at 62.5 kS/s.
+        prefill=max(1,round(self.buffer_ms/self.bank_ms)) # 125-sample bank: 2 ms, or 4 ms narrow.
         started=False;epoch=0;sent_samples=0;last_report=time.monotonic()
         try:
             while not finished.is_set() or not frames.empty():
@@ -213,7 +217,7 @@ class ClientSession:
                 if delay>0 and self.stop.wait(delay):break
                 self.client.sendall(unsigned_iq(output,self.gain_db))
                 sent_samples+=len(output);self.stats['forwarded_samples']+=len(output)
-                self.stats['buffered_ms']=frames.qsize()*2
+                self.stats['buffered_ms']=frames.qsize()*self.bank_ms
                 if time.monotonic()-last_report>=1:self.record();last_report=time.monotonic()
         finally:
             abort.set()
@@ -228,6 +232,8 @@ class ClientSession:
         commands = threading.Thread(target=self.read_commands, name='rtl-commands', daemon=True)
         commands.start()
         try:
+            if self.narrow and (self.packed_verification is not None or self.stream_rate!=31250):
+                raise BridgeError('Narrow mode is native 31250 S/s; it does not combine with packed or 62500')
             if self.serial and self.packed_verification is not None and self.stream_rate!=31250:
                 raise BridgeError('Experimental packed USB live requires --stream-rate 31250 to fit the UART')
             while not self.stop.is_set():
@@ -248,7 +254,9 @@ class ClientSession:
                     info = b.info()
                     if info.get('compact_stream') != 'LIQ8':
                         raise BridgeError('Install Nomad firmware 0.4.0 or newer for compact live streaming')
-                    if self.stream_rate==31250 and info.get('decimated_stream')!='LID8':
+                    if self.narrow and 31250 not in (b.request('capabilities').get('native_rates') or []):
+                        raise BridgeError('Install firmware with native 31250 S/s (narrow) support')
+                    if not self.narrow and self.stream_rate==31250 and info.get('decimated_stream')!='LID8':
                         raise BridgeError('Install Nomad firmware 0.5.0 for the stable 31.25 kS/s stream')
                     verified=None
                     if self.packed_verification is not None:
@@ -257,15 +265,16 @@ class ClientSession:
                         prepare_packed(b,settings.corrected_frequency,NATIVE_RATE,verified)
                         job['acquisition']='arc8'
                     else:
-                        NomadReceiver(b).configure(settings.corrected_frequency, NATIVE_RATE)
+                        NomadReceiver(b).configure(settings.corrected_frequency, 31250 if self.narrow else NATIVE_RATE)
                     if self.stop.is_set():
                         break
                     command='streampd' if self.stream_rate==31250 else 'streamp8'
-                    wire=f'{command} {NATIVE_RATE} 0 {verified["uid"]}' if verified is not None else f'{"streamd" if self.stream_rate==31250 else "stream8"} {NATIVE_RATE} 0'
+                    if self.narrow:wire='stream8 31250 0'
+                    else:wire=f'{command} {NATIVE_RATE} 0 {verified["uid"]}' if verified is not None else f'{"streamd" if self.stream_rate==31250 else "stream8"} {NATIVE_RATE} 0'
                     ack = b.request(wire)
                     if verified is not None and ack.get('acquisition')!='arc8':
                         raise BridgeError('Expected ARC acquisition acknowledgement',ack)
-                    if ack.get('stream') != ('LID8' if self.stream_rate==31250 else 'LIQ8') or ack.get('format') != 'iq8_block_float':
+                    if ack.get('stream') != ('LID8' if self.stream_rate==31250 and not self.narrow else 'LIQ8') or ack.get('format') != 'iq8_block_float':
                         raise BridgeError('Unexpected compact stream acknowledgement', ack)
                     self.pipe_stream(b,job,generation,interpolator)
                 self.record()
@@ -288,7 +297,7 @@ class ClientSession:
 
 
 def serve(host='192.168.4.1', radio=0, listen='127.0.0.1', port=1234,
-          frequency=915000000, output_rate=250000, gain_db=60.0, report=None, ready=None, stop=None,stream_rate=31250,buffer_ms=250,serial=None,packed_verification=None):
+          frequency=915000000, output_rate=250000, gain_db=60.0, report=None, ready=None, stop=None,stream_rate=31250,buffer_ms=250,serial=None,packed_verification=None,narrow=False):
     stop = stop or threading.Event()
     with socket.socket() as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -307,7 +316,7 @@ def serve(host='192.168.4.1', radio=0, listen='127.0.0.1', port=1234,
                 except socket.timeout:
                     continue
                 LOG.info('Client connected: %s', address)
-                ClientSession(client, host, radio, frequency, output_rate, gain_db, report,stream_rate,buffer_ms,serial,packed_verification).run()
+                ClientSession(client, host, radio, frequency, output_rate, gain_db, report,stream_rate,buffer_ms,serial,packed_verification,narrow).run()
         except KeyboardInterrupt:
             LOG.info('Server stopped')
 
@@ -357,6 +366,8 @@ def parse_args(argv=None):
     p.add_argument('--port', type=int, default=1234)
     p.add_argument('--frequency', type=int, default=915000000)
     p.add_argument('--frequency2', type=int, default=2440000000, help='Radio 1 start frequency with --radio both')
+    p.add_argument('--narrow', action='store_true',
+                   help='Native 31.25 kS/s from the LR1121 (~11 kHz usable, half the SPI load); implied by --radio both')
     p.add_argument('--output-rate', type=int, choices=OUTPUT_RATES, default=250000)
     p.add_argument('--gain-db', type=float, default=60.0, help='Software gain before rtl_tcp 8-bit output')
     p.add_argument('--stream-rate', type=int, choices=(31250,62500), default=None, help='Stream I/Q rate; USB and Wi-Fi default to 31250')
@@ -377,10 +388,16 @@ def parse_args(argv=None):
             p.error('--packed-verification binds one chip; run it with --radio 0 or 1')
         if not valid_frequency(a.frequency2):
             p.error('--frequency2 is outside the LR1121 synthesizer range: 150..2500 MHz')
+        # Two full-width (62.5 kS/s) streams exceed the shared 16 MHz SPI bus.
+        a.narrow = True
     else:
         a.radio = int(a.radio)
     if not a.serial and a.host is None:
         a.host = '192.168.4.1'
+    if a.narrow and a.stream_rate == 62500:
+        p.error('--narrow is the native 31250 S/s stream; drop --stream-rate 62500')
+    if a.narrow and a.packed_verification is not None:
+        p.error('--narrow does not combine with --packed-verification')
     if a.stream_rate is None:
         a.stream_rate = 31250
     return a

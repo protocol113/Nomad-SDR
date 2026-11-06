@@ -1,9 +1,10 @@
 # RadioMaster XR4 SDR port
 
-Status: **running on XR4 hardware (2026-11-05).** Both radios stream over UART
-with zero lost samples (radio 0 at 915 MHz, radio 1 at 2440 MHz, 3 s captures,
-31.25 kS/s LID8). Sensitivity, dual-radio Wi-Fi streaming and power draw are
-not yet measured.
+Status: **running on XR4 hardware (2026-11-05).** Each radio streams over UART
+or Wi-Fi with zero lost samples. Both radios stream **at the same time** over
+Wi-Fi in narrow mode (31.25 kS/s each, see below): live feeds 15 s and
+recordings 10 s with zero loss; 60 s depends on Wi-Fi signal (below).
+Sensitivity and power draw are not yet measured.
 
 The XR4 (Gemini Xrossband true-diversity receiver) carries the same ESP32 and
 two LR1121 chips as the Nomad, on the same SPI bus. This port reuses the Nomad
@@ -111,6 +112,86 @@ mode for a standalone receiver because the board needs only 5 V power.
 router, exactly as on the Nomad.
 
 The `fan` command reports `"fan":"none"`. `led INDEX R G B` accepts only index 0.
+
+## Monitor both radios at once (Wi-Fi)
+
+Two live feeds, one per radio, for SDR++ (RTL-TCP source) or SDRangel:
+
+```sh
+python host/nomad_rtl_tcp.py --radio both --host XR4_IP
+```
+
+Radio 0 serves `127.0.0.1:1234` (start 915 MHz, `--frequency`), radio 1
+`127.0.0.1:1235` (start 2440 MHz, `--frequency2`). Each feed tunes, starts and
+stops on its own; they are not sample-synchronized. Select 250 kHz in the GUI.
+Status files are `build/rtl-tcp-status.radio0.json` / `.radio1.json`.
+
+Recording both radios:
+
+```sh
+python host/nomad_rx.py --host XR4_IP --radio both --rate 31250 \
+  --frequency 915000000 --frequency2 2440000000 --seconds 60 --output both.cf32
+```
+
+Dual mode uses **narrow** acquisition: the LR1121 itself delivers 31.25 kS/s
+(GFSK RX bandwidth code `0x0E`, rate field 6 at `0xF20124`) with its own
+14.6 kHz (nominal) filter. Usable bandwidth is about **11 kHz per radio**,
+against about 22 kHz for the single-radio default (62.5 kS/s acquired, FIR /2 on
+the ESP32). `--radio both` selects narrow automatically; `--narrow` (live) or
+`--rate 31250` (recorder) selects it for one radio.
+
+Why not two full-width radios: both LR1121s share one 16 MHz SPI bus, and a
+62.5 kS/s bank (125 samples every 2 ms) costs about 1.3 ms of ESP32 time per
+radio. Narrow banks arrive every 4 ms and cost about 1.07 ms, so two radios use
+about 53% of the budget.
+
+Serial (UART) carries one radio: 921600 baud fits one 31.25 kS/s stream.
+
+**Wi-Fi signal decides long dual sessions.** Two feeds need about 150 kB/s;
+the XR4 measured about 250 kB/s total over TCP at -73 dBm, and the two
+connections do not share it evenly. Slow patches longer than the ~415 ms send
+buffer per radio end a stream with `flags: 2` (queue full). Place the XR4 for
+-60 dBm or better (`bridge.py ... wifi` reports `rssi_dbm`). The 2.4 GHz band
+is the only one the ESP32 joins.
+
+## Update firmware without the boot button
+
+Builds with `#define NOMAD_OTA_PASSWORD "..."` in the git-ignored
+`nomad/src/wifi.local.h` accept Wi-Fi updates (espota, UDP 3232), refused while
+a radio streams:
+
+```sh
+python ~/.platformio/packages/framework-arduinoespressif32/tools/espota.py \
+  -i XR4_IP -a PASSWORD -f nomad/.pio/build/radiomaster_xr4/firmware.bin
+```
+
+Every build accepts updates over the serial adapter while the firmware runs,
+also when Wi-Fi is down:
+
+```sh
+python tools/serial_update.py --port PORT nomad/.pio/build/radiomaster_xr4/firmware.bin
+```
+
+The board checks the image MD5 before switching, then reboots (about 18 s for
+880 KB). If start-up fails (for example, out of memory), the firmware enters a
+**safe mode** instead of reboot-looping: it prints `SAFE MODE: <reason>` on the
+UART every second and stays reachable for both update paths. The boot button is
+needed only if the running image cannot start at all.
+
+## Timing and memory (`perf`)
+
+`<id> perf` (UART or TCP) reports acquisition timing since `<id> perf reset`:
+per-bank total, SPI, BUSY wait, FIR, empty polls, plus free heap. Measured on
+the XR4 (firmware with the IRAM SPI path):
+
+| Mode | Bank period | Per bank (avg / max) | SPI |
+| --- | --- | --- | --- |
+| 62.5 kS/s, FIR /2 to 31.25 (default) | 2 ms | 1297 / 1420 us | 686 us |
+| Native 31.25 kS/s (narrow) | 4 ms | 1068 / 1223 us | 717 us |
+
+Keep idle free heap above about 60 KB. Below that the ESP32 dropped full-size
+Wi-Fi packets (100% loss on 1400-byte pings) and TCP stalled; the send queues
+are sized to leave about 80 KB.
 
 ## Not yet verified on hardware
 

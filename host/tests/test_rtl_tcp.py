@@ -163,6 +163,18 @@ class DualMonitorTests(unittest.TestCase):
                      ['--radio','both','--stream-rate','62500','--frequency2','100000000']):
             with self.assertRaises(SystemExit),patch('sys.stderr',io.StringIO()):parse_args(argv)
 
+    def test_both_implies_native_narrow_rate(self):
+        self.assertTrue(parse_args(['--radio','both']).narrow)
+        self.assertFalse(parse_args(['--radio','0']).narrow)
+        self.assertTrue(parse_args(['--radio','1','--narrow']).narrow)
+        for argv in (['--narrow','--stream-rate','62500'],['--radio','both','--stream-rate','62500']):
+            with self.assertRaises(SystemExit),patch('sys.stderr',io.StringIO()):parse_args(argv)
+
+    def test_narrow_session_banks_are_4ms(self):
+        with socket.socket() as sock:
+            self.assertEqual(ClientSession(sock,'h',0,915000000,250000,60,narrow=True).bank_ms,4)
+            self.assertEqual(ClientSession(sock,'h',0,915000000,250000,60).bank_ms,2)
+
     def test_serial_refusal_explains_why(self):
         err=io.StringIO()
         with self.assertRaises(SystemExit),patch('sys.stderr',err):parse_args(['--radio','both','--serial','COM3'])
