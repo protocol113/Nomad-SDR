@@ -175,6 +175,17 @@ class DualMonitorTests(unittest.TestCase):
             self.assertEqual(ClientSession(sock,'h',0,915000000,250000,60,narrow=True).bank_ms,4)
             self.assertEqual(ClientSession(sock,'h',0,915000000,250000,60).bank_ms,2)
 
+    def test_both_packed_is_full_width_not_narrow(self):
+        # Two per-chip verify.json: packed full-width (62.5 acq, ~20 kHz), 2 ms banks.
+        a=parse_args(['--radio','both','--packed-verification','r0.json','r1.json'])
+        self.assertFalse(a.narrow)
+        self.assertEqual([str(p) for p in a.packed_verification],['r0.json','r1.json'])
+        # One path for --radio both is rejected; so is one for a single radio taking two.
+        for argv in (['--radio','both','--packed-verification','only.json'],
+                     ['--radio','1','--packed-verification','a.json','b.json']):
+            with self.assertRaises(SystemExit),patch('sys.stderr',io.StringIO()):parse_args(argv)
+        self.assertEqual(str(parse_args(['--radio','1','--packed-verification','a.json']).packed_verification),'a.json')
+
     def test_serial_refusal_explains_why(self):
         err=io.StringIO()
         with self.assertRaises(SystemExit),patch('sys.stderr',err):parse_args(['--radio','both','--serial','COM3'])

@@ -201,6 +201,28 @@ class NomadTests(unittest.TestCase):
             main(['--radio', 'both', '--rate', '125000', '--output', 'unused.cf32'])
         bridge.assert_not_called()
 
+    def test_dual_packed_requires_two_verifications(self):
+        for argv in (['--radio', 'both', '--packed-verification', 'r0.json', '--output', 'u.cf32'],
+                     ['--radio', 'both', '--packed-verification', 'a.json', 'b.json', 'c.json', '--output', 'u.cf32'],
+                     ['--radio', '0', '--packed-verification', 'a.json', 'b.json', '--output', 'u.cf32']):
+            with patch('nomad_rx.Bridge') as bridge, patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit):
+                main(argv)
+            bridge.assert_not_called()
+
+    def test_dual_packed_passes_per_radio_verification(self):
+        calls = []
+        def fake_capture(host, radio, frequency, rate, seconds, output, barrier=None, **kw):
+            calls.append((radio, frequency, str(kw.get('packed_verification'))))
+            if barrier is not None:
+                barrier.wait(timeout=5)
+            return {'radio': radio, 'complete': True}
+        with patch('nomad_rx.capture', side_effect=fake_capture):
+            main(['--radio', 'both', '--rate', '62500', '--decimate',
+                  '--packed-verification', 'r0.json', 'r1.json',
+                  '--frequency', '915000000', '--frequency2', '2440000000',
+                  '--output', 'both.cf32'])
+        self.assertEqual(sorted(calls), [(0, 915000000, 'r0.json'), (1, 2440000000, 'r1.json')])
+
     def test_uart_large_capture_rejected_before_connect(self):
         with patch('nomad_rx.Bridge') as bridge, self.assertRaisesRegex(ValueError, '32 blocks'):
             capture('localhost', 0, 915000000, 62500, 2, 'unused.cf32', port='COM3')

@@ -165,16 +165,19 @@ def flash(b, image, out, expected_app=APP):
 
 def initialize_verification_radio(b):
     info = b.info()
-    if info.get('board') != 'radiomaster-nomad':
+    # Nomad and XR4 are crystal boards served by nomad/ firmware; both use the
+    # same setup, differing only in the SetDioAsRfSwitch (0x0112) table. Only a
+    # genuinely unknown board falls back to the Waveshare TCXO/LF-clock profile.
+    from boards import BOARDS, rf_switch_command
+    if info.get('board') not in BOARDS:
         return Core1121(b).initialize()
     if info.get('radio') not in (0, 1):
-        raise RuntimeError('Invalid Nomad radio identity')
-    # Callback self-test needs crystal standby, not RX or a DMA ring. Do not
-    # use the Waveshare TCXO/LF-clock profile on the Nomad's crystal board.
+        raise RuntimeError('Invalid dual-LR1121 radio identity')
+    # Callback self-test needs crystal standby, not RX or a DMA ring.
     from nomad_rx import NomadReceiver
     receiver = NomadReceiver(b)
     for command, mode in (('011c00', 1), ('011001', 1),
-                          ('01120f00040808020001', 1), ('010e', 1),
+                          (rf_switch_command(info), 1), ('010e', 1),
                           ('010f3f', 1), ('011400800000', 1), ('011c01', 2)):
         receiver.write(command, mode)
 

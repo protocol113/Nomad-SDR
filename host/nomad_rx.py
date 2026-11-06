@@ -295,7 +295,9 @@ def main(argv=None):
     p.add_argument('--host', default='192.168.4.1')
     p.add_argument('--compact', action='store_true', help='Use LIQ8 block floating I/Q for live networking')
     p.add_argument('--decimate', action='store_true', help='Anti-alias FIR /2 and compact LID8 networking')
-    p.add_argument('--packed-verification',type=Path,help='Experimental ARC acquisition: per-chip successful FIFO1 verify.json')
+    p.add_argument('--packed-verification',type=Path,nargs='+',metavar='VERIFY_JSON',
+                   help='ARC packed acquisition: per-chip verify.json. One path for a single radio, '
+                        'or two (radio0 radio1) for --radio both.')
     p.add_argument('--port', help='Main ESP32 USB UART, e.g. COM3; compact streams are USB native mode')
     p.add_argument('--radio', choices=('0', '1', 'both'), default='0')
     p.add_argument('--frequency', type=int, default=915_000_000)
@@ -304,8 +306,12 @@ def main(argv=None):
     p.add_argument('--seconds', type=float, default=2)
     p.add_argument('--output', type=Path, required=True, help='cf32_le file; both mode adds .radio0/.radio1')
     a = p.parse_args(argv)
-    if a.packed_verification is not None and a.radio=='both':
-        p.error('Experimental packed capture requires selecting one verified radio')
+    pv = a.packed_verification
+    if pv is not None:
+        if a.radio == 'both' and len(pv) != 2:
+            p.error('--radio both with --packed-verification needs two verify.json paths: radio0 radio1')
+        if a.radio != 'both' and len(pv) != 1:
+            p.error('a single radio takes one --packed-verification verify.json')
     if a.radio == 'both' and a.rate not in (31250, 62500):
         p.error('Dual capture supports 62500 or native 31250 S/s per radio; SPI bandwidth is shared')
     if a.port is not None and a.radio == 'both':
@@ -318,10 +324,11 @@ def main(argv=None):
                 jobs = [pool.submit(capture, a.host, i, a.frequency if i == 0 else a.frequency2,
                                     a.rate, a.seconds,
                                     a.output.with_name(a.output.stem + f'.radio{i}' + a.output.suffix),
-                                    barrier,compact=a.compact,decimate=a.decimate) for i in range(2)]
+                                    barrier,compact=a.compact,decimate=a.decimate,
+                                    packed_verification=(pv[i] if pv else None)) for i in range(2)]
                 results = [job.result() for job in jobs]
         else:
-            results = [capture(a.host, int(a.radio), a.frequency, a.rate, a.seconds, a.output, port=a.port,compact=a.compact,decimate=a.decimate,packed_verification=a.packed_verification)]
+            results = [capture(a.host, int(a.radio), a.frequency, a.rate, a.seconds, a.output, port=a.port,compact=a.compact,decimate=a.decimate,packed_verification=(pv[0] if pv else None))]
         print(json.dumps(results, indent=2))
         return 0
     except (BridgeError, RadioError, OSError, ValueError, RuntimeError) as exc:

@@ -327,15 +327,19 @@ def radio_report(report, radio):
 
 
 def serve_both(host='192.168.4.1', listen='127.0.0.1', ports=(1234, 1235),
-               frequencies=(915000000, 2440000000), report=None, ready=None, stop=None, **options):
+               frequencies=(915000000, 2440000000), packed_verifications=(None, None),
+               report=None, ready=None, stop=None, **options):
     """Two independent rtl_tcp feeds, radio 0 and radio 1, over Wi-Fi.
 
     Each radio has its own firmware TCP session (1121 / 1122), so the feeds
     tune, start and stop independently. They are not sample-synchronized.
+    With a per-chip packed verification each feed is full-width (62.5 kS/s
+    acquired, ~20 kHz usable); otherwise each is narrow (31.25 kS/s native).
     """
     stop = stop or threading.Event()
     threads = [threading.Thread(target=serve, name=f'radio{radio}', daemon=True, kwargs=dict(
         options, host=host, radio=radio, listen=listen, port=ports[radio], frequency=frequencies[radio],
+        packed_verification=packed_verifications[radio],
         report=radio_report(report, radio), stop=stop,
         ready=(lambda port, radio=radio: ready(radio, port)) if ready else None)) for radio in (0, 1)]
     for thread in threads:
@@ -359,7 +363,9 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--host', default=None, help='Nomad IP from the UART wifi command')
     p.add_argument('--serial', help='USB native mode: main ESP32 UART such as COM3')
-    p.add_argument('--packed-verification',type=Path,help='Experimental ARC acquisition: successful per-chip FIFO1 verify.json')
+    p.add_argument('--packed-verification',type=Path,nargs='+',metavar='VERIFY_JSON',
+                   help='ARC packed acquisition: per-chip verify.json. One path for a single radio, '
+                        'or two (radio0 radio1) for --radio both full-width dual.')
     p.add_argument('--radio', choices=('0', '1', 'both'), default='0',
                    help="'both' serves radio 0 on --port and radio 1 on --port+1 (Wi-Fi only)")
     p.add_argument('--listen', default='127.0.0.1')
@@ -384,14 +390,22 @@ def parse_args(argv=None):
     if both:
         if a.serial:
             p.error('--radio both needs Wi-Fi (--host): the 921600-baud serial link carries one radio at 31.25 kS/s')
-        if a.packed_verification is not None:
-            p.error('--packed-verification binds one chip; run it with --radio 0 or 1')
         if not valid_frequency(a.frequency2):
             p.error('--frequency2 is outside the LR1121 synthesizer range: 150..2500 MHz')
-        # Two full-width (62.5 kS/s) streams exceed the shared 16 MHz SPI bus.
-        a.narrow = True
+        if a.packed_verification is not None:
+            # On-chip packing cuts SPI 4x, so two full-width (62.5 kS/s) streams fit.
+            if len(a.packed_verification) != 2:
+                p.error('--radio both with --packed-verification needs two verify.json paths: radio0 radio1')
+            a.narrow = False
+        else:
+            # Two unpacked full-width streams exceed the shared 16 MHz SPI bus.
+            a.narrow = True
     else:
         a.radio = int(a.radio)
+        if a.packed_verification is not None and len(a.packed_verification) != 1:
+            p.error('a single radio takes one --packed-verification verify.json')
+        if a.packed_verification is not None:
+            a.packed_verification = a.packed_verification[0]
     if not a.serial and a.host is None:
         a.host = '192.168.4.1'
     if a.narrow and a.stream_rate == 62500:
@@ -409,9 +423,13 @@ def main():
     options = vars(a)
     if options.pop('radio') == 'both':
         port, frequency, frequency2 = options.pop('port'), options.pop('frequency'), options.pop('frequency2')
-        options.pop('serial'); options.pop('packed_verification')
-        LOG.info('Monitoring both radios: radio 0 -> 127.0.0.1:%d, radio 1 -> 127.0.0.1:%d', port, port+1)
-        serve_both(ports=(port, port+1), frequencies=(frequency, frequency2), **options)
+        options.pop('serial')
+        pv = options.pop('packed_verification')
+        packed_verifications = tuple(pv) if pv else (None, None)
+        mode = 'full-width packed' if pv else 'narrow'
+        LOG.info('Monitoring both radios (%s): radio 0 -> 127.0.0.1:%d, radio 1 -> 127.0.0.1:%d', mode, port, port+1)
+        serve_both(ports=(port, port+1), frequencies=(frequency, frequency2),
+                   packed_verifications=packed_verifications, **options)
     else:
         options.pop('frequency2')
         serve(radio=a.radio, **options)

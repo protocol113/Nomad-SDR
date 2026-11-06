@@ -1,11 +1,12 @@
 # RadioMaster XR4 SDR port
 
-Status: **running on XR4 hardware (2026-11-05).** Each radio streams over UART
-or Wi-Fi with zero lost samples. Both radios stream **at the same time** over
-Wi-Fi in narrow mode (31.25 kS/s each, see below): two 60 s recordings (radio 0
-at 915 MHz, radio 1 at 2440 MHz) and 15 s of two live feeds, all with zero lost
-samples, at a weak -74 dBm Wi-Fi signal. Sensitivity and power draw are not yet
-measured.
+Status: **running on XR4 hardware (2026-11-05).** Each radio streams over UART or
+Wi-Fi with zero lost samples. Both radios stream **at the same time, full width**
+(~20 kHz usable each) over Wi-Fi with the on-chip packing add-on: two 60 s
+recordings (radio 0 at 915 MHz, radio 1 at 2440 MHz) and 15 s of two live feeds,
+all with zero lost samples at a weak -74 dBm signal, measuring 19.8-20.0 kHz at
+-3 dB per radio. A narrow dual mode (~11 kHz each) needs no chip changes.
+Sensitivity and power draw are not yet measured.
 
 The XR4 (Gemini Xrossband true-diversity receiver) carries the same ESP32 and
 two LR1121 chips as the Nomad, on the same SPI bus. This port reuses the Nomad
@@ -104,6 +105,42 @@ python lr1121/install.py restore-elrs --port PORT --radio 0 --out build/xr4-radi
 python lr1121/install.py restore-elrs --port PORT --radio 1 --out build/xr4-radio1
 ```
 
+## Install the on-chip packing add-on (for full-width dual)
+
+Full-width dual streaming needs the LR1121 ARC packing add-on on **both** chips.
+It appends MIT-licensed custom code (`lr1121/extension`) to the stock encrypted
+1.3 application through the CBC-oracle route (`docs/nomad-extension-experiment.md`);
+the bootloader is never touched and the chip still identifies as `22030103`.
+Do this over the **wired serial adapter**, not Wi-Fi: a dropped packet mid-flash
+is the one step with real recovery cost.
+
+Build the add-on once (needs the binutils submodule; builds ARC binutils):
+
+```sh
+git submodule update --init external/binutils
+python tools/build_extension.py        # -> build/lr1121/stream.bin
+```
+
+Then per chip (forge is oracle-only, no flash; install flashes + self-tests):
+
+```sh
+python lr1121/install.py forge   --port PORT --radio 0 --payload build/lr1121/stream.bin --out build/xr4-radio0
+python lr1121/install.py install --port PORT --radio 0 --payload build/lr1121/stream.bin --out build/xr4-radio0
+python lr1121/install.py forge   --port PORT --radio 1 --payload build/lr1121/stream.bin --out build/xr4-radio1
+python lr1121/install.py install --port PORT --radio 1 --payload build/lr1121/stream.bin --out build/xr4-radio1
+```
+
+Each `install` writes `build/xr4-radioN/verify.json` with the chip's UID and the
+IQP3/FIFO1 self-test result; the capture tools require a successful one. Restore
+a chip to plain stock 1.3 at any time (removes the add-on from flash):
+
+```sh
+python lr1121/install.py stock --port PORT --radio 0 --out build/xr4-radio0
+```
+
+Keep the forged `custom-app.encrypted.bin` private: the route exploits a known
+weakness in Semtech's update encryption. It is for your own hardware only.
+
 ## Use
 
 Every Nomad workflow in the [README](../README.md) applies. Replace `COM3` with the
@@ -116,35 +153,63 @@ The `fan` command reports `"fan":"none"`. `led INDEX R G B` accepts only index 0
 
 ## Monitor both radios at once (Wi-Fi)
 
-Two live feeds, one per radio, for SDR++ (RTL-TCP source) or SDRangel:
+There are two dual modes. **Full-width packed** gives each radio ~20 kHz and
+needs the on-chip packing add-on on both LR1121s ([install below](#full-width-dual-on-chip-packing)).
+**Narrow** needs no chip changes but gives each radio ~11 kHz.
+
+### Full-width dual (on-chip packing)
+
+Once both chips carry the verified add-on, each radio streams the full 62.5 kS/s
+acquisition (~20 kHz usable) at the same time. Live feeds for SDR++ / SDRangel:
 
 ```sh
-python host/nomad_rtl_tcp.py --radio both --host XR4_IP
+python host/nomad_rtl_tcp.py --radio both --host XR4_IP \
+  --packed-verification build/xr4-radio0/verify.json build/xr4-radio1/verify.json
 ```
+
+Recording both radios for 60 s:
+
+```sh
+python host/nomad_rx.py --host XR4_IP --radio both --rate 62500 --decimate \
+  --packed-verification build/xr4-radio0/verify.json build/xr4-radio1/verify.json \
+  --frequency 915000000 --frequency2 2440000000 --seconds 60 --output both.cf32
+```
+
+The LR1121 ARC core packs each 62.5 kS/s bank to signed 8-bit (adaptive per-bank
+block-float) before the ESP32 reads it, cutting the SPI bytes per bank ~4x (256
+vs 1000). The ESP32 then runs the /2 anti-alias FIR and sends LID8 at 31.25 kS/s.
+Measured on XR4 hardware (both radios, two 60 s recordings, 0 lost samples):
+**19.8-20.0 kHz at -3 dB per radio**. Per bank the SPI drops to ~235 us (from
+~700 us unpacked) and the whole bank costs ~790 us, so two radios use ~79% of the
+2 ms budget. 8-bit packing costs ~4-8 dB of dynamic range against the 23-bit
+unpacked single-radio path, but the dual result is better than narrow dual
+(packband-to-stopband ~36 dB packed vs ~24 dB narrow), not worse.
+
+### Narrow dual (no chip changes)
+
+```sh
+python host/nomad_rtl_tcp.py --radio both --host XR4_IP        # live
+python host/nomad_rx.py --host XR4_IP --radio both --rate 31250 \
+  --frequency 915000000 --frequency2 2440000000 --seconds 60 --output both.cf32
+```
+
+Narrow uses the LR1121's own 31.25 kS/s rate (GFSK RX bandwidth code `0x0E`,
+rate field 6 at `0xF20124`, ~14.6 kHz nominal filter). Usable bandwidth is about
+**11 kHz per radio**. `--radio both` selects narrow automatically when no
+`--packed-verification` is given; `--narrow` (live) or `--rate 31250` (recorder)
+selects it for one radio.
+
+### Both modes
 
 Radio 0 serves `127.0.0.1:1234` (start 915 MHz, `--frequency`), radio 1
 `127.0.0.1:1235` (start 2440 MHz, `--frequency2`). Each feed tunes, starts and
 stops on its own; they are not sample-synchronized. Select 250 kHz in the GUI.
 Status files are `build/rtl-tcp-status.radio0.json` / `.radio1.json`.
+Serial (UART) carries one radio: 921600 baud fits one 31.25 kS/s stream.
 
-Recording both radios:
-
-```sh
-python host/nomad_rx.py --host XR4_IP --radio both --rate 31250 \
-  --frequency 915000000 --frequency2 2440000000 --seconds 60 --output both.cf32
-```
-
-Dual mode uses **narrow** acquisition: the LR1121 itself delivers 31.25 kS/s
-(GFSK RX bandwidth code `0x0E`, rate field 6 at `0xF20124`) with its own
-14.6 kHz (nominal) filter. Usable bandwidth is about **11 kHz per radio**,
-against about 22 kHz for the single-radio default (62.5 kS/s acquired, FIR /2 on
-the ESP32). `--radio both` selects narrow automatically; `--narrow` (live) or
-`--rate 31250` (recorder) selects it for one radio.
-
-Why not two full-width radios: both LR1121s share one 16 MHz SPI bus, and a
-62.5 kS/s bank (125 samples every 2 ms) costs about 1.3 ms of ESP32 time per
-radio. Narrow banks arrive every 4 ms and cost about 1.07 ms, so two radios use
-about 53% of the budget.
+Why packing is needed for full width: both LR1121s share one 16 MHz SPI bus, and
+reading an unpacked 62.5 kS/s bank (1000 bytes every 2 ms) costs ~1.3 ms of ESP32
+time per radio, so two will not fit. On-chip packing cuts that read to ~235 us.
 
 Serial (UART) carries one radio: 921600 baud fits one 31.25 kS/s stream.
 
