@@ -1,11 +1,21 @@
 /* SPDX-License-Identifier: MIT */
 #include "compact.h"
+#ifdef ESP_PLATFORM
+/* Per-bank hot path: keep it in internal RAM so Wi-Fi activity on the other
+   core cannot evict it from the shared flash cache, and optimize for speed. */
+#include "esp_attr.h"
+#define HOT
+#define HOT_DATA
+#else
+#define HOT
+#define HOT_DATA
+#endif
 
-static int32_t component(const uint8_t *p) {
+static HOT int32_t component(const uint8_t *p) {
     uint32_t v=p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16;
     return (int32_t)(v&0x3fffffu)-(int32_t)(v&0x400000u);
 }
-static bool pack_components(uint8_t *dst,const uint8_t *src,unsigned count) {
+static HOT bool pack_components(uint8_t *dst,const uint8_t *src,unsigned count) {
     uint32_t peak=0;
     for (unsigned i=0;i<count;++i) {
         if (src[3*i+2]&0x80) return false;
@@ -52,36 +62,48 @@ bool nomad_expand8(uint8_t *dst,const uint8_t *src) {
 }
 
 /* firwin(33, .4), Hamming window, Q15, exact unity DC gain. */
-static const int16_t taps[33]={50,0,-81,-74,110,256,0,-496,-413,551,1183,0,
+static HOT_DATA const int16_t taps[33]={50,0,-81,-74,110,256,0,-496,-413,551,1183,0,
     -2144,-1884,2956,9824,13092,9824,2956,-1884,-2144,0,1183,551,-413,-496,
     0,256,110,-74,-81,0,50};
-static void encode(uint8_t *p,int64_t sum) {
-    int64_t value=sum<0?-((-sum+16384)/32768):(sum+16384)/32768;
+static HOT void encode(uint8_t *p,int64_t sum) {
+    /* Round half away from zero, /32768: identical to the division form for
+       both signs, without the ESP32's software 64-bit divide. */
+    int64_t value=sum<0?-((-sum+16384)>>15):(sum+16384)>>15;
     if(value>4194303)value=4194303;
     if(value< -4194304)value= -4194304;
     uint32_t v=(uint32_t)value&0x7fffff;
     p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);p[2]=(uint8_t)(v>>16);
 }
-unsigned nomad_decimate8(uint8_t *dst,const uint8_t *src,nomad_decimator_t *state) {
+/* Symmetric taps: fold mirrored pairs and skip zero taps (14 multiplies per
+   channel instead of 33). Sums are exact, so output is unchanged. */
+static HOT int64_t fir(const int32_t *w) {
+    int64_t sum=(int64_t)w[16]*taps[16];
+    static HOT_DATA const uint8_t used[13]={0,2,3,4,5,7,8,9,10,12,13,14,15};
+    for(unsigned k=0;k<13;++k) {
+        unsigned t=used[k];
+        sum+=(int64_t)(w[t]+w[32-t])*taps[t];
+    }
+    return sum;
+}
+HOT unsigned nomad_decimate8(uint8_t *dst,const uint8_t *src,nomad_decimator_t *state) {
     uint8_t filtered[63*6];
     unsigned count=0;
     for(unsigned n=0;n<125;++n) {
         const uint8_t *sample=src+n*6;
         if((sample[2]|sample[5])&0x80)return 0;
-        state->i[state->position]=component(sample);
-        state->q[state->position]=component(sample+3);
+        /* Doubled history: the 33-sample window ending at position is
+           contiguous at [position+1, position+33], oldest first. */
+        unsigned position=state->position;
+        int32_t i=component(sample),q=component(sample+3);
+        state->i[position]=state->i[position+33]=i;
+        state->q[position]=state->q[position+33]=q;
         if(!state->phase) {
-            int64_t i=0,q=0;
-            unsigned cursor=state->position;
-            for(unsigned tap=0;tap<33;++tap) {
-                i+=(int64_t)state->i[cursor]*taps[tap];
-                q+=(int64_t)state->q[cursor]*taps[tap];
-                cursor=cursor?cursor-1:32;
-            }
-            encode(filtered+count*6,i);encode(filtered+count*6+3,q);++count;
+            encode(filtered+count*6,fir(state->i+position+1));
+            encode(filtered+count*6+3,fir(state->q+position+1));
+            ++count;
         }
         state->phase^=1;
-        state->position=(state->position+1)%33;
+        state->position=position==32?0:position+1;
     }
     return pack_components(dst,filtered,count*2)?count:0;
 }

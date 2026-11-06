@@ -37,5 +37,8 @@ constexpr bool has_fan = fan >= 0;
 constexpr uint16_t port[2] = {1121, 1122};
 constexpr uint32_t stream_spi = 16000000;
 constexpr uint32_t uart_baud = 921600;
-constexpr unsigned queue_frames = 48;
+// Per-radio send queue (full LIQ1 frames). 40 keeps ~415 ms of LIQ8/LID8 Wi-Fi
+// jitter headroom while leaving ~80 KB heap: below ~60 KB idle, Wi-Fi drops
+// full-size RX packets and TCP stalls during dual streaming.
+constexpr unsigned queue_frames = 40;
 }
