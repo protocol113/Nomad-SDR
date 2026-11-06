@@ -312,33 +312,92 @@ def serve(host='192.168.4.1', radio=0, listen='127.0.0.1', port=1234,
             LOG.info('Server stopped')
 
 
-def main():
+def radio_report(report, radio):
+    """build/x.json -> build/x.radio0.json so two feeds never share a status file."""
+    return None if report is None else Path(report).with_suffix(f'.radio{radio}{Path(report).suffix}')
+
+
+def serve_both(host='192.168.4.1', listen='127.0.0.1', ports=(1234, 1235),
+               frequencies=(915000000, 2440000000), report=None, ready=None, stop=None, **options):
+    """Two independent rtl_tcp feeds, radio 0 and radio 1, over Wi-Fi.
+
+    Each radio has its own firmware TCP session (1121 / 1122), so the feeds
+    tune, start and stop independently. They are not sample-synchronized.
+    """
+    stop = stop or threading.Event()
+    threads = [threading.Thread(target=serve, name=f'radio{radio}', daemon=True, kwargs=dict(
+        options, host=host, radio=radio, listen=listen, port=ports[radio], frequency=frequencies[radio],
+        report=radio_report(report, radio), stop=stop,
+        ready=(lambda port, radio=radio: ready(radio, port)) if ready else None)) for radio in (0, 1)]
+    for thread in threads:
+        thread.start()
+    try:
+        while any(thread.is_alive() for thread in threads):
+            if stop.wait(.25):
+                break
+            if not all(thread.is_alive() for thread in threads):
+                LOG.error('One radio feed stopped; stopping both')
+                break
+    except KeyboardInterrupt:
+        LOG.info('Server stopped')
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=8)
+
+
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--host', default=None, help='Nomad IP from the UART wifi command')
     p.add_argument('--serial', help='USB native mode: main ESP32 UART such as COM3')
     p.add_argument('--packed-verification',type=Path,help='Experimental ARC acquisition: successful per-chip FIFO1 verify.json')
-    p.add_argument('--radio', type=int, choices=(0, 1), default=0)
+    p.add_argument('--radio', choices=('0', '1', 'both'), default='0',
+                   help="'both' serves radio 0 on --port and radio 1 on --port+1 (Wi-Fi only)")
     p.add_argument('--listen', default='127.0.0.1')
     p.add_argument('--port', type=int, default=1234)
     p.add_argument('--frequency', type=int, default=915000000)
+    p.add_argument('--frequency2', type=int, default=2440000000, help='Radio 1 start frequency with --radio both')
     p.add_argument('--output-rate', type=int, choices=OUTPUT_RATES, default=250000)
     p.add_argument('--gain-db', type=float, default=60.0, help='Software gain before rtl_tcp 8-bit output')
     p.add_argument('--stream-rate', type=int, choices=(31250,62500), default=None, help='Stream I/Q rate; USB and Wi-Fi default to 31250')
     p.add_argument('--buffer-ms', type=int, choices=range(50,751), metavar='50..750', default=250, help='Host jitter prebuffer in milliseconds')
     p.add_argument('--report', type=Path, default=Path('build/rtl-tcp-status.json'))
-    a = p.parse_args()
+    a = p.parse_args(argv)
+    both = a.radio == 'both'
     if not valid_frequency(a.frequency) or not math.isfinite(a.gain_db) or not 0 <= a.gain_db <= 100:
         p.error('Choose a supported frequency and software gain 0..100 dB')
-    if not 1 <= a.port <= 65535:
-        p.error('Port must be 1..65535')
+    if not 1 <= a.port <= (65534 if both else 65535):
+        p.error('Port must be 1..65535 (both radios also use --port+1)')
     if a.serial and a.host:
         p.error('Use either --serial (USB native) or --host (Wi-Fi)')
+    if both:
+        if a.serial:
+            p.error('--radio both needs Wi-Fi (--host): the 921600-baud serial link carries one radio at 31.25 kS/s')
+        if a.packed_verification is not None:
+            p.error('--packed-verification binds one chip; run it with --radio 0 or 1')
+        if not valid_frequency(a.frequency2):
+            p.error('--frequency2 is outside the LR1121 synthesizer range: 150..2500 MHz')
+    else:
+        a.radio = int(a.radio)
     if not a.serial and a.host is None:
         a.host = '192.168.4.1'
     if a.stream_rate is None:
         a.stream_rate = 31250
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-    serve(**vars(a))
+    return a
+
+
+def main():
+    a = parse_args()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(threadName)s %(message)s')
+    options = vars(a)
+    if options.pop('radio') == 'both':
+        port, frequency, frequency2 = options.pop('port'), options.pop('frequency'), options.pop('frequency2')
+        options.pop('serial'); options.pop('packed_verification')
+        LOG.info('Monitoring both radios: radio 0 -> 127.0.0.1:%d, radio 1 -> 127.0.0.1:%d', port, port+1)
+        serve_both(ports=(port, port+1), frequencies=(frequency, frequency2), **options)
+    else:
+        options.pop('frequency2')
+        serve(radio=a.radio, **options)
 
 
 if __name__ == '__main__':

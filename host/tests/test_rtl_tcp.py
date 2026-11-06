@@ -13,7 +13,7 @@ import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from bridge import BridgeError
 from nomad_rx import HEADER,read_frame
-from nomad_rtl_tcp import COMMAND,DONGLE_HEADER,ClientSession,Interpolator,Settings,unsigned_iq,serve
+from nomad_rtl_tcp import COMMAND,DONGLE_HEADER,ClientSession,Interpolator,Settings,unsigned_iq,serve,serve_both,parse_args
 
 def compact_frame(sequence=0,shift=6,kind=1):
     payload=bytes([shift])+bytes([64,192])*125 if kind==1 else struct.pack('<9I',sequence,sequence,0,0,0,16000000,0,0,0)
@@ -126,5 +126,46 @@ class RTLTests(unittest.TestCase):
                 while len(received)<2 and time.monotonic()<limit:time.sleep(.01)
             finally:stop.set();thread.join(2)
         self.assertEqual(received,[(1,915000000),(1,2440000000)])
+
+class DualMonitorTests(unittest.TestCase):
+    def test_both_radios_serve_side_by_side(self):
+        stop=threading.Event();ready={};seen=[];lock=threading.Lock()
+        def fake_run(session):
+            with lock:seen.append((session.radio,session.host,session.settings.frequency,str(session.report_path)))
+            session.client.sendall(DONGLE_HEADER);session.client.close()
+        with patch.object(ClientSession,'run',fake_run):
+            thread=threading.Thread(target=serve_both,kwargs=dict(host='xr4',ports=(0,0),frequencies=(915000000,2440000000),
+                report=Path('build/status.json'),stop=stop,ready=lambda radio,port:ready.__setitem__(radio,port)))
+            thread.start()
+            try:
+                limit=time.monotonic()+2
+                while len(ready)<2 and time.monotonic()<limit:time.sleep(.01)
+                self.assertEqual(sorted(ready),[0,1])
+                # Both feeds are open at the same time before either client leaves.
+                a=socket.create_connection(('127.0.0.1',ready[0]),timeout=2)
+                b=socket.create_connection(('127.0.0.1',ready[1]),timeout=2)
+                for s in (a,b):
+                    header=bytearray()
+                    while len(header)<12:header.extend(s.recv(12-len(header)))
+                    self.assertEqual(header,DONGLE_HEADER);s.close()
+                while len(seen)<2 and time.monotonic()<limit:time.sleep(.01)
+            finally:stop.set();thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(sorted(seen),[(0,'xr4',915000000,str(Path('build/status.radio0.json'))),
+                                       (1,'xr4',2440000000,str(Path('build/status.radio1.json')))])
+
+    def test_both_arguments(self):
+        a=parse_args(['--radio','both'])
+        self.assertEqual((a.radio,a.port,a.frequency,a.frequency2,a.host),('both',1234,915000000,2440000000,'192.168.4.1'))
+        self.assertEqual(parse_args(['--radio','1']).radio,1)
+        for argv in (['--radio','both','--serial','/dev/ttyUSB0'],
+                     ['--radio','both','--port','65535'],
+                     ['--radio','both','--stream-rate','62500','--frequency2','100000000']):
+            with self.assertRaises(SystemExit),patch('sys.stderr',io.StringIO()):parse_args(argv)
+
+    def test_serial_refusal_explains_why(self):
+        err=io.StringIO()
+        with self.assertRaises(SystemExit),patch('sys.stderr',err):parse_args(['--radio','both','--serial','COM3'])
+        self.assertIn('Wi-Fi',err.getvalue())
 
 if __name__=='__main__':unittest.main()
