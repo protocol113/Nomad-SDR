@@ -23,5 +23,10 @@ subprocess.run([os.environ.get('CC','gcc'),'-std=c11','-Wall','-Wextra','-Werror
                 '-I'+str(ROOT/'nomad/src'),str(ROOT/'nomad/tests/test_compact.c'),
                 str(ROOT/'nomad/src/compact.c'),'-lm','-o',str(binary)],check=True)
 subprocess.run([str(binary)],check=True)
+binary=out/('test_ook.exe' if os.name=='nt' else 'test_ook')
+subprocess.run([os.environ.get('CC','gcc'),'-std=c11','-Wall','-Wextra','-Werror',
+                '-I'+str(ROOT/'nomad/src'),str(ROOT/'nomad/tests/test_ook.c'),
+                str(ROOT/'nomad/src/ook.c'),'-o',str(binary)],check=True)
+subprocess.run([str(binary)],check=True)
 for directory in ('host/tests', 'lr1121/tests'):
     subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-s', str(ROOT / directory), '-v'], check=True)

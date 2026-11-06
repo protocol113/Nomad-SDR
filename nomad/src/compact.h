@@ -12,7 +12,7 @@ bool nomad_pack8(uint8_t *dst, const uint8_t *src);
 bool nomad_arc8(uint8_t *dst, const uint8_t *words_be, uint32_t sequence);
 bool nomad_expand8(uint8_t *dst, const uint8_t *src);
 typedef struct {
-    int32_t i[33], q[33];
+    int32_t i[66], q[66]; /* doubled 33-sample history */
     unsigned position, phase;
 } nomad_decimator_t;
 /* Stateful anti-alias FIR /2. Returns 63 or 62 complex samples, 0 on error. */

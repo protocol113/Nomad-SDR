@@ -29,7 +29,72 @@ static double tone(double frequency) {
     }
     return sqrt(power/count)/1000000;
 }
+/* Frozen copy of the original direct-form FIR /2 (33 taps, int64 division).
+   The firmware's faster version must stay byte-identical to it. */
+static const int16_t ref_taps[33]={50,0,-81,-74,110,256,0,-496,-413,551,1183,0,
+    -2144,-1884,2956,9824,13092,9824,2956,-1884,-2144,0,1183,551,-413,-496,
+    0,256,110,-74,-81,0,50};
+typedef struct { int32_t i[33],q[33]; unsigned position,phase; } ref_state_t;
+static int32_t ref_component(const uint8_t *p) {
+    uint32_t v=p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16;
+    return (int32_t)(v&0x3fffffu)-(int32_t)(v&0x400000u);
+}
+static void ref_encode(uint8_t *p,int64_t sum) {
+    int64_t value=sum<0?-((-sum+16384)/32768):(sum+16384)/32768;
+    if(value>4194303)value=4194303;
+    if(value< -4194304)value= -4194304;
+    encode(p,(int32_t)value);
+}
+static unsigned ref_filter(uint8_t *filtered,const uint8_t *src,ref_state_t *s) {
+    unsigned count=0;
+    for(unsigned n=0;n<125;++n) {
+        s->i[s->position]=ref_component(src+n*6);s->q[s->position]=ref_component(src+n*6+3);
+        if(!s->phase) {
+            int64_t i=0,q=0;unsigned cursor=s->position;
+            for(unsigned tap=0;tap<33;++tap) {
+                i+=(int64_t)s->i[cursor]*ref_taps[tap];q+=(int64_t)s->q[cursor]*ref_taps[tap];
+                cursor=cursor?cursor-1:32;
+            }
+            ref_encode(filtered+count*6,i);ref_encode(filtered+count*6+3,q);++count;
+        }
+        s->phase^=1;s->position=(s->position+1)%33;
+    }
+    return count;
+}
+/* Reference block-float packing of count*2 filtered components. */
+static void ref_pack(uint8_t *dst,const uint8_t *filtered,unsigned components) {
+    int32_t peak=0;
+    for(unsigned k=0;k<components;++k){int32_t v=ref_component(filtered+3*k);if((v<0?-v:v)>peak)peak=v<0?-v:v;}
+    unsigned shift=0;while(peak>(127<<shift))++shift;
+    dst[0]=(uint8_t)shift;
+    for(unsigned k=0;k<components;++k) {
+        int32_t v=ref_component(filtered+3*k),m=v<0?-v:v;
+        if(shift)m=(m+(1<<(shift-1)))>>shift;
+        dst[1+k]=(uint8_t)(v<0?-m:m);
+    }
+}
+static void decimator_matches_reference(void) {
+    nomad_decimator_t state={0};ref_state_t ref={0};
+    uint8_t input[750],output[251],filtered[63*6],expected[251];
+    uint32_t random=99;
+    for(unsigned block=0;block<2000;++block) {
+        for(unsigned c=0;c<250;++c) {
+            random=random*1664525u+1013904223u;
+            int32_t v=(int32_t)(random&0x7fffff)-4194304;
+            if(block%5==1)v=(random&1)?4194303:-4194304;   /* full-scale extremes */
+            else if(block%5==2)v>>=(block/5)%20;              /* small signals */
+            else if(block%5==3)v=(c/2)%2?4194303:-4194304;    /* worst-case alternating */
+            encode(input+3*c,v);
+        }
+        unsigned count=ref_filter(filtered,input,&ref);
+        ref_pack(expected,filtered,count*2);
+        assert(nomad_decimate8(output,input,&state)==count);
+        assert(!memcmp(output,expected,1+count*2));
+    }
+    puts("FIR /2: byte-identical to the reference filter over 2000 blocks");
+}
 int main(void) {
+    decimator_matches_reference();
     uint8_t input[750],output[251];
     uint8_t arc[256]={0};
     arc[0]=0x85;arc[3]=1;

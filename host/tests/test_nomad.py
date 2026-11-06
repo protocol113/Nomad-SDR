@@ -201,6 +201,28 @@ class NomadTests(unittest.TestCase):
             main(['--radio', 'both', '--rate', '125000', '--output', 'unused.cf32'])
         bridge.assert_not_called()
 
+    def test_dual_packed_requires_two_verifications(self):
+        for argv in (['--radio', 'both', '--packed-verification', 'r0.json', '--output', 'u.cf32'],
+                     ['--radio', 'both', '--packed-verification', 'a.json', 'b.json', 'c.json', '--output', 'u.cf32'],
+                     ['--radio', '0', '--packed-verification', 'a.json', 'b.json', '--output', 'u.cf32']):
+            with patch('nomad_rx.Bridge') as bridge, patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit):
+                main(argv)
+            bridge.assert_not_called()
+
+    def test_dual_packed_passes_per_radio_verification(self):
+        calls = []
+        def fake_capture(host, radio, frequency, rate, seconds, output, barrier=None, **kw):
+            calls.append((radio, frequency, str(kw.get('packed_verification'))))
+            if barrier is not None:
+                barrier.wait(timeout=5)
+            return {'radio': radio, 'complete': True}
+        with patch('nomad_rx.capture', side_effect=fake_capture):
+            main(['--radio', 'both', '--rate', '62500', '--decimate',
+                  '--packed-verification', 'r0.json', 'r1.json',
+                  '--frequency', '915000000', '--frequency2', '2440000000',
+                  '--output', 'both.cf32'])
+        self.assertEqual(sorted(calls), [(0, 915000000, 'r0.json'), (1, 2440000000, 'r1.json')])
+
     def test_uart_large_capture_rejected_before_connect(self):
         with patch('nomad_rx.Bridge') as bridge, self.assertRaisesRegex(ValueError, '32 blocks'):
             capture('localhost', 0, 915000000, 62500, 2, 'unused.cf32', port='COM3')
@@ -234,6 +256,48 @@ class NomadTests(unittest.TestCase):
             self.assertFalse(json.loads(path.with_suffix('.cf32.json').read_text())['complete'])
             with self.assertRaises(FileExistsError):
                 capture('localhost', 0, 915000000, 62500, .002, path)
+
+    def compact_stream(self, data_frames, terminal_flags, rate=31250):
+        wire = b''
+        for seq in range(data_frames):
+            payload = bytes([0]) + bytes(250)
+            head = HEADER.pack(b'LIQ8', 1, 1, 0, 1, seq, seq * 125, 125, len(payload), rate, 2000, zlib.crc32(payload), 0)
+            wire += head[:40] + struct.pack('<I', zlib.crc32(head[:40])) + payload
+        stats = struct.pack('<9I', data_frames, data_frames, 1, 4, 100, 16000000, 2000, 0, 0)
+        head = HEADER.pack(b'LIQ8', 1, 2, terminal_flags, 1, data_frames, data_frames * 125, 0, len(stats), rate, 2000, zlib.crc32(stats), 0)
+        return wire + head[:40] + struct.pack('<I', zlib.crc32(head[:40])) + stats
+
+    def test_long_capture_streams_open_ended_and_cancels_at_target(self):
+        # Beyond the fixed-length request limit: 0 blocks, host cancels (0x03)
+        # once the target arrives, extra in-flight frames are discarded, and
+        # only a clean abort (flags == IQ_ABORT, 0 lost) counts as complete.
+        transport = io.BytesIO(self.compact_stream(4, terminal_flags=4))
+        b = Bridge(transport=transport)
+        b._id = 1
+        written = []
+        b.io.write = lambda data: written.append(bytes(data)) or len(data)
+        b.io.flush = lambda: None
+        with tempfile.TemporaryDirectory() as folder, patch('nomad_rx.MAX_FIXED_BLOCKS', 2), \
+                patch('nomad_rx.Bridge', return_value=b), patch.object(NomadReceiver, 'configure', return_value={}), \
+                patch.object(b, 'request', return_value=dict(stream='LIQ8', format='iq8_block_float')) as request:
+            path = Path(folder) / 'long.cf32'
+            result = capture('localhost', 0, 915000000, 31250, .012, path)
+            request.assert_called_once_with('stream8 31250 0')
+            self.assertEqual(written, [b'\x03'])
+            self.assertTrue(result['complete'])
+            self.assertEqual(result['samples'], 375)
+            self.assertEqual(path.stat().st_size, 3 * 125 * 8)
+
+    def test_long_capture_rejects_abort_with_loss(self):
+        b = Bridge(transport=io.BytesIO(self.compact_stream(3, terminal_flags=4 | 1)))
+        b._id = 1
+        b.io.write = lambda data: len(data)
+        b.io.flush = lambda: None
+        with tempfile.TemporaryDirectory() as folder, patch('nomad_rx.MAX_FIXED_BLOCKS', 2), \
+                patch('nomad_rx.Bridge', return_value=b), patch.object(NomadReceiver, 'configure', return_value={}), \
+                patch.object(b, 'request', return_value=dict(stream='LIQ8', format='iq8_block_float')):
+            with self.assertRaisesRegex(BridgeError, 'loss/error'):
+                capture('localhost', 0, 915000000, 31250, .012, Path(folder) / 'bad.cf32')
 
     def test_complete_capture_writes_cf32_and_metadata(self):
         b = Bridge(transport=io.BytesIO(frame() + frame(kind=2, seq=1)))

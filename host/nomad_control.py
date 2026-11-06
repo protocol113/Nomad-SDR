@@ -16,6 +16,7 @@ import uuid
 
 from bridge import Bridge, BridgeError
 from frequency import valid_frequency, receiver_band
+from boards import BoardError, rf_switch_command
 from nomad_rx import NomadReceiver
 
 LORA_BW = {125000:4,250000:5,500000:6,203125:13,406250:14,812500:15}
@@ -230,13 +231,15 @@ class Radio:
         with self.lock,self.board.lock:
             self.idle()
             self.profile=None;self.running=False
-            if self.b.info().get('board')!='radiomaster-nomad' or self.b.version()['data']!='22030103':
-                raise ValueError('Expected Nomad with LR1121 transceiver 0x0103')
+            try:rf_switch=rf_switch_command(self.b.info())
+            except BoardError as error:raise ValueError(str(error)) from None
+            if self.b.version()['data']!='22030103':
+                raise ValueError('Expected LR1121 transceiver 0x0103')
             self.identity=dict(radio=self.index,version='22030103',uid=self.read('0125',8).hex(),
                                packed_extension_state='per-session-verification-required')
             self.b.speed(500000);self.b.reset()
             self.agc_default=self.rx.memory(0xf20230)[0]
-            for cmd,mode in (('011c00',1),('011001',1),('01120f00040808020001',1),
+            for cmd,mode in (('011c00',1),('011001',1),(rf_switch,1),
                              ('010e',1),('010f3f',1),('011400800000',1),('011c01',2)):
                 self.write(cmd,mode)
             self.write('020e'+('02' if p['modem']=='lora' else '01'),2)

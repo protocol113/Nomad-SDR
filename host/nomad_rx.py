@@ -21,10 +21,17 @@ import zlib
 from bridge import Bridge, BridgeError
 from lr1121 import RadioError
 from frequency import valid_frequency, receiver_band
+from boards import BoardError, rf_switch_command
 
 HEADER = struct.Struct('<4sBBH9I')
 CONTROL = 0x9FE3E7A7
-RATES = (62500, 125000)
+RATES = (31250, 62500, 125000)
+# LR1121 GFSK RX bandwidth code -> native rate field (rate = 2 MHz / 2**field).
+# 31250 ("narrow") uses the chip's own 14.6 kHz filter: half the SPI load.
+BANDWIDTH_CODE = {31250: 0x0E, 62500: 0x0D, 125000: 0x0C}
+RATE_FIELD = {31250: 6, 62500: 5, 125000: 4}
+MAX_FIXED_BLOCKS = 8192  # Device limit for a fixed-length stream request.
+IQ_ABORT = 4  # Terminal flag: host cancelled (pico/firmware/stream_format.h).
 
 
 def descriptor(index):
@@ -55,10 +62,14 @@ class NomadReceiver:
         if not valid_frequency(frequency):
             raise ValueError('LR1121 synthesizer frequency must be 150..2500 MHz')
         if rate not in RATES:
-            raise ValueError('Nomad rate must be 62500 or 125000')
+            raise ValueError('Nomad rate must be 31250, 62500 or 125000')
         info = self.b.info()
-        if info.get('board') != 'radiomaster-nomad' or info.get('radio') not in (0, 1):
-            raise RadioError('Expected a RadioMaster Nomad bridge', info)
+        try:
+            rf_switch = rf_switch_command(info)
+        except BoardError as error:
+            raise RadioError(str(error), info) from None
+        if info.get('radio') not in (0, 1):
+            raise RadioError('Expected a dual-LR1121 bridge radio 0 or 1', info)
         version = self.b.version()
         if version.get('data') != '22030103':
             raise RadioError('SDR requires stock LR1121 transceiver 1.3 (22030103); '
@@ -67,9 +78,9 @@ class NomadReceiver:
         self.b.reset()
         self.write('011c00', 1)
         self.write('011001', 1)
-        # Nomad/ELRS default switch table, NOT the Waveshare board's table.
-        # No TCXO or external 32 kHz clock setup: absent in the Nomad target.
-        self.write('01120f00040808020001', 1)
+        # Per-board ELRS switch table (host/boards.py), NOT the Waveshare one.
+        # No TCXO or external 32 kHz clock setup: absent in Nomad and XR4 targets.
+        self.write(rf_switch, 1)
         self.write('010e', 1)
         self.write('010f3f', 1)
         self.write('011400800000', 1)
@@ -90,11 +101,11 @@ class NomadReceiver:
         elif 410_000_000 <= frequency <= 510_000_000:
             self.write('0229cc0e314463666666060000',2)
         # GFSK filter selects the native 62.5/125 kS/s decimation setting.
-        self.write('020f0000271009' + ('0d' if rate == 62500 else '0c') + '00001388', 2)
+        self.write(f'020f0000271009{BANDWIDTH_CODE[rate]:02x}00001388', 2)
         self.write('0210002004200001ff0101', 2)
         self.write('02061234567800000000', 2)
         value = self.memory(0xF20124)[0]
-        if ((value >> 20) & 7) != (5 if rate == 62500 else 4) or ((value >> 24) & 3) != 1:
+        if ((value >> 20) & 7) != RATE_FIELD[rate] or ((value >> 24) & 3) != 1:
             raise RadioError('Unexpected native rate; no ring written')
         self.write('0209ffffff', 4)
         time.sleep(.03)
@@ -193,13 +204,20 @@ def read_frame(io, job_id, rate, sequence, compact=False):
 
 
 def capture(host, radio, frequency, rate, seconds, output, barrier=None, port=None, compact=False,decimate=False,packed_verification=None):
-    compact = compact or decimate or packed_verification is not None
+    if rate == 31250 and (decimate or packed_verification is not None):
+        raise ValueError('31250 S/s is the native narrow rate; it does not combine with --decimate or packed')
+    compact = compact or decimate or packed_verification is not None or rate == 31250
     verified = json.loads(Path(packed_verification).read_text()) if packed_verification is not None else None
     if rate not in RATES or not math.isfinite(seconds) or seconds <= 0:
         raise ValueError('Select a supported rate and positive finite duration')
     blocks = math.ceil(seconds * rate / 125)
-    if not 1 <= blocks <= 8192:
-        raise ValueError('Capture must fit 1..8192 blocks; shorten --seconds')
+    if blocks < 1:
+        raise ValueError('Capture must be at least one block')
+    # The device takes at most MAX_FIXED_BLOCKS per fixed-length request. Longer
+    # captures stream open-ended (0) and the host cancels on the target block.
+    open_ended = blocks > MAX_FIXED_BLOCKS
+    if open_ended and (port is not None or not compact and not decimate and rate != 31250):
+        raise ValueError(f'Captures over {MAX_FIXED_BLOCKS} blocks need a compact TCP stream')
     if port is not None and not compact and blocks > 32:
         raise ValueError('UART LIQ1 smoke capture is limited to 32 blocks; use --compact or --seconds 0.032 at 62500 S/s')
     if verified is not None and port is not None and (rate==125000 or not decimate) and blocks>128:
@@ -227,24 +245,36 @@ def capture(host, radio, frequency, rate, seconds, output, barrier=None, port=No
                     if barrier is not None:
                         barrier.wait(timeout=60)
                     command = 'streampd' if decimate else 'streamp8'
-                    wire = f'{command} {rate} {blocks} {verified["uid"]}' if verified is not None else f'{"streamd" if decimate else "stream8" if compact else "stream2"} {rate} {blocks}'
+                    requested = 0 if open_ended else blocks
+                    wire = f'{command} {rate} {requested} {verified["uid"]}' if verified is not None else f'{"streamd" if decimate else "stream8" if compact else "stream2"} {rate} {requested}'
                     ack = bridge.request(wire)
                     if verified is not None and ack.get('acquisition')!='arc8':
                         raise BridgeError('Expected ARC packed acquisition acknowledgement',ack)
                     if ack.get('stream') != ('LID8' if decimate else 'LIQ8' if compact else 'LIQ1') or ack.get('format') != ('iq8_block_float' if compact else 'iq23le'):
                         raise BridgeError('Invalid Nomad stream acknowledgement', ack)
                     sequence = 0
+                    cancelled = False
                     while True:
                         samples, stats = read_frame(bridge.io, bridge._id, rate//2 if decimate else rate, sequence, compact=compact)
                         if stats is not None:
                             metadata['stats'] = stats
-                            if stats['flags'] or stats['lost_samples'] or sequence != blocks:
+                            # Open-ended: the only acceptable end is our own
+                            # cancel (IQ_ABORT) after the target, with 0 lost.
+                            clean = (stats['flags'] == IQ_ABORT and cancelled and sequence >= blocks) if open_ended \
+                                else (not stats['flags'] and sequence == blocks)
+                            if not clean or stats['lost_samples']:
                                 raise BridgeError(f'Capture stopped with loss/error: {stats}')
                             metadata['complete'] = True
-                            metadata['samples'] = (sequence*125+1)//2 if decimate else sequence*125
+                            metadata['samples'] = (blocks*125+1)//2 if decimate else blocks*125
                             break
-                        data.write(samples)
+                        if sequence < blocks:
+                            data.write(samples)
                         sequence += 1
+                        if open_ended and sequence == blocks and not cancelled:
+                            if bridge.io.write(b'\x03') != 1:
+                                raise BridgeError('Failed to cancel open-ended capture')
+                            bridge.io.flush()
+                            cancelled = True
             except BaseException as exc:
                 metadata['error'] = str(exc)
                 if barrier is not None:
@@ -265,7 +295,9 @@ def main(argv=None):
     p.add_argument('--host', default='192.168.4.1')
     p.add_argument('--compact', action='store_true', help='Use LIQ8 block floating I/Q for live networking')
     p.add_argument('--decimate', action='store_true', help='Anti-alias FIR /2 and compact LID8 networking')
-    p.add_argument('--packed-verification',type=Path,help='Experimental ARC acquisition: per-chip successful FIFO1 verify.json')
+    p.add_argument('--packed-verification',type=Path,nargs='+',metavar='VERIFY_JSON',
+                   help='ARC packed acquisition: per-chip verify.json. One path for a single radio, '
+                        'or two (radio0 radio1) for --radio both.')
     p.add_argument('--port', help='Main ESP32 USB UART, e.g. COM3; compact streams are USB native mode')
     p.add_argument('--radio', choices=('0', '1', 'both'), default='0')
     p.add_argument('--frequency', type=int, default=915_000_000)
@@ -274,10 +306,14 @@ def main(argv=None):
     p.add_argument('--seconds', type=float, default=2)
     p.add_argument('--output', type=Path, required=True, help='cf32_le file; both mode adds .radio0/.radio1')
     a = p.parse_args(argv)
-    if a.packed_verification is not None and a.radio=='both':
-        p.error('Experimental packed capture requires selecting one verified radio')
-    if a.radio == 'both' and a.rate != 62500:
-        p.error('Dual capture supports 62500 S/s per radio; SPI bandwidth is shared')
+    pv = a.packed_verification
+    if pv is not None:
+        if a.radio == 'both' and len(pv) != 2:
+            p.error('--radio both with --packed-verification needs two verify.json paths: radio0 radio1')
+        if a.radio != 'both' and len(pv) != 1:
+            p.error('a single radio takes one --packed-verification verify.json')
+    if a.radio == 'both' and a.rate not in (31250, 62500):
+        p.error('Dual capture supports 62500 or native 31250 S/s per radio; SPI bandwidth is shared')
     if a.port is not None and a.radio == 'both':
         p.error('UART uses one radio per capture; use TCP for simultaneous capture')
     try:
@@ -288,10 +324,11 @@ def main(argv=None):
                 jobs = [pool.submit(capture, a.host, i, a.frequency if i == 0 else a.frequency2,
                                     a.rate, a.seconds,
                                     a.output.with_name(a.output.stem + f'.radio{i}' + a.output.suffix),
-                                    barrier,compact=a.compact,decimate=a.decimate) for i in range(2)]
+                                    barrier,compact=a.compact,decimate=a.decimate,
+                                    packed_verification=(pv[i] if pv else None)) for i in range(2)]
                 results = [job.result() for job in jobs]
         else:
-            results = [capture(a.host, int(a.radio), a.frequency, a.rate, a.seconds, a.output, port=a.port,compact=a.compact,decimate=a.decimate,packed_verification=a.packed_verification)]
+            results = [capture(a.host, int(a.radio), a.frequency, a.rate, a.seconds, a.output, port=a.port,compact=a.compact,decimate=a.decimate,packed_verification=(pv[0] if pv else None))]
         print(json.dumps(results, indent=2))
         return 0
     except (BridgeError, RadioError, OSError, ValueError, RuntimeError) as exc:

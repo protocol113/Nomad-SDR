@@ -19,6 +19,7 @@ import install as extension
 from bridge import Bridge
 from nomad_rx import NomadReceiver, descriptor
 from frequency import valid_frequency
+from boards import BOARDS
 
 
 def write_words(b, address, values):
@@ -177,8 +178,8 @@ def main():
             try:
                 b.speed(500000); b.reset()
                 info = b.info()
-                if info.get('board') != 'radiomaster-nomad' or info.get('radio') != args.radio:
-                    raise RuntimeError('Expected the selected RadioMaster Nomad radio')
+                if info.get('board') not in BOARDS or info.get('radio') != args.radio:
+                    raise RuntimeError('Expected the selected dual-LR1121 board radio')
                 if b.version()['data'] != extension.APP:
                     raise RuntimeError('Unexpected radio firmware')
                 uid = b._payload(b.read_command(bytes.fromhex('0125'), 8), 8).hex()

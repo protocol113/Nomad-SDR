@@ -7,16 +7,30 @@
 #include <atomic>
 #include <algorithm>
 #include "esp32-hal-spi.h"
+#include "soc/spi_struct.h"
+#include "soc/gpio_struct.h"
+#include "rom/ets_sys.h"
 #include "lwip/opt.h"
+#include "lwip/api.h"
+#include "lwip/tcp.h"
+#include "lwip/tcpip.h"
+extern "C" {
+#include "lwip/priv/sockets_priv.h"
+}
 #include "board.h"
 #include "compact.h"
 #include "indicators.h"
 #if __has_include("wifi.local.h")
 #include "wifi.local.h"
 #endif
+#ifdef NOMAD_OTA_PASSWORD
+#include <ArduinoOTA.h>
+#endif
+#include <Update.h>
 extern "C" {
 #include "protocol.h"
 #include "stream_format.h"
+#include "ook.h"
 }
 
 #ifndef NOMAD_AP_SSID
@@ -109,7 +123,7 @@ static void saveWifiCredentials() {
 }
 static void startNetwork() {
     WiFi.persistent(false);
-    WiFi.setHostname("nomad-sdr");
+    WiFi.setHostname(board::hostname);
     WiFi.setSleep(false);
     if (staEnabled()) {
         WiFi.mode(WIFI_STA);
@@ -168,6 +182,7 @@ struct Radio {
     uint64_t elapsed=0;
     // Parser options also change for ordinary RPCs. Keep the last accepted
     // stream's format separately so info/read requests do not corrupt telemetry.
+    bool sendBufferGrown=false; // Once per TCP connection; reset on accept.
     bool streamCompact=false,streamDecimated=false,streamPacked=false;
     uint32_t streamRate=0;
     uint64_t start, deadline;
@@ -244,11 +259,26 @@ struct BusLock {
     ~BusLock() { xSemaphoreGive(spiMutex); }
 };
 static uint64_t now() { return esp_timer_get_time(); }
+// Acquisition timing breakdown (only the acquire task writes these). Read with
+// "<id> perf", clear with "<id> perf reset". Used to size the dual-radio budget.
+static TaskHandle_t acquireTask=nullptr;
+static struct Perf {
+    uint64_t banks,bankUs,maxBankUs,polls,pollMisses,pollMissUs,busyUs,spiUs,transfers,dspUs;
+} perf;
+static bool inAcquire() { return acquireTask && xTaskGetCurrentTaskHandle()==acquireTask; }
+static std::atomic<bool> otaBusy{false};
 static bool telemetryRequest(const char *line,Print &out,uint32_t id) {
     char command[16]={0},action[16]={0},extra;
     int n=sscanf(line,"%*u %15s %15s %c",command,action,&extra);
+    if(!strcmp(command,"perf") && (n==1 || (n==2 && !strcmp(action,"reset")))) {
+        if(n==2) memset(&perf,0,sizeof(perf));
+        out.printf("{\"id\":%lu,\"ok\":true,\"free_heap\":%u,\"largest_block\":%u,\"free_dma\":%u,\"min_free_heap\":%u,\"banks\":%llu,\"bank_us\":%llu,\"avg_bank_us\":%llu,\"max_bank_us\":%llu,\"polls\":%llu,\"poll_misses\":%llu,\"poll_miss_us\":%llu,\"busy_wait_us\":%llu,\"spi_us\":%llu,\"transfers\":%llu,\"dsp_us\":%llu}\n",
+            (unsigned long)id,ESP.getFreeHeap(),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+            unsigned(heap_caps_get_free_size(MALLOC_CAP_DMA)),ESP.getMinFreeHeap(),perf.banks,perf.bankUs,perf.banks?perf.bankUs/perf.banks:0ull,perf.maxBankUs,perf.polls,perf.pollMisses,perf.pollMissUs,perf.busyUs,perf.spiUs,perf.transfers,perf.dspUs);
+        return true;
+    }
     if(n==1 && !strcmp(command,"capabilities")) {
-        out.printf("{\"id\":%lu,\"ok\":true,\"schema\":1,\"board\":\"radiomaster-nomad\",\"radios\":2,\"frequency_hz\":[150000000,2500000000],\"native_rates\":[62500,125000],\"streams\":[\"LIQ1\",\"LIQ8\",\"LID8\"],\"packed_requires_per_chip_verification\":true,\"packed_extension_probed\":false,\"usb_live_native_rate\":62500,\"usb_live_output_rate\":31250,\"uart_baud\":%lu,\"packed_usb_burst_max_banks\":128,\"fan\":true,\"rgb_leds\":2,\"control_api\":\"host/nomad_api.py\"}\n",(unsigned long)id,(unsigned long)board::uart_baud);
+        out.printf("{\"id\":%lu,\"ok\":true,\"schema\":1,\"board\":\"%s\",\"rf_switch\":\"%s\",\"radios\":2,\"frequency_hz\":[150000000,2500000000],\"native_rates\":[31250,62500,125000],\"streams\":[\"LIQ1\",\"LIQ8\",\"LID8\"],\"packed_requires_per_chip_verification\":true,\"packed_extension_probed\":false,\"usb_live_native_rate\":62500,\"usb_live_output_rate\":31250,\"uart_baud\":%lu,\"packed_usb_burst_max_banks\":128,\"fan\":%s,\"rgb_leds\":%u,\"control_api\":\"host/nomad_api.py\"}\n",(unsigned long)id,board::name,board::rf_switch,(unsigned long)board::uart_baud,board::has_fan?"true":"false",board::led_count);
         return true;
     }
     if(n!=2 || strcmp(command,"stream") || strcmp(action,"status"))return false;
@@ -268,38 +298,66 @@ static void updateIndicators() {
         radios[0].queue?uxQueueMessagesWaiting(radios[0].queue):0,radios[0].queueCapacity,
         radios[1].queue?uxQueueMessagesWaiting(radios[1].queue):0,radios[1].queueCapacity);
 }
-static void be32(uint8_t *p, uint32_t v) {
+static IRAM_ATTR void be32(uint8_t *p, uint32_t v) {
     p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v;
 }
-static bool ready(Radio &r, uint32_t ms) {
-    uint64_t until=now()+uint64_t(ms)*1000;
-    uint64_t lastYield=now();
-    while (ms && digitalRead(board::busy[r.index])) {
-        if (now()>=until) return false;
-        delayMicroseconds(5);
+// Radio SPI hot path. Measured on XR4: through the Arduino HAL from flash, a
+// 7-byte transfer cost ~130 us (15 us begin, 16 us end, cache-miss bound) and
+// the total moved by hundreds of us between builds with code layout. These
+// helpers live in IRAM and drive VSPI (SPI3) registers directly, so per-bank
+// cost no longer depends on flash cache luck. radioSPI.begin() and one
+// transaction in setup() configure pins, full duplex and SPI mode 0, MSB first.
+static IRAM_ATTR bool pinHigh(int pin) {
+    return pin<32 ? (GPIO.in>>pin)&1 : (GPIO.in1.val>>(pin-32))&1;
+}
+static IRAM_ATTR void pinWrite(int pin,bool high) {
+    if (pin<32) { if (high) GPIO.out_w1ts=1u<<pin; else GPIO.out_w1tc=1u<<pin; }
+    else if (high) GPIO.out1_w1ts.val=1u<<(pin-32); else GPIO.out1_w1tc.val=1u<<(pin-32);
+}
+static IRAM_ATTR bool ready(Radio &r, uint32_t ms) {
+    uint64_t start=now(),until=start+uint64_t(ms)*1000;
+    uint64_t lastYield=start;
+    bool ok=true;
+    while (ms && pinHigh(board::busy[r.index])) {
+        if (now()>=until) { ok=false; break; }
         if (now()-lastYield>=1000) { vTaskDelay(1); lastYield=now(); }
     }
-    return true;
+    if (inAcquire()) perf.busyUs+=now()-start;
+    return ok;
 }
-static void transfer(Radio &r, const uint8_t *tx, uint8_t *rx, size_t n) {
-    radioSPI.beginTransaction(SPISettings(r.speed, MSBFIRST, SPI_MODE0));
-    digitalWrite(board::cs[r.index], LOW);
-    delayMicroseconds(1);
-    // The Arduino HAL loads whole 32-bit words, including a partial final
-    // word. Stage short/unaligned buffers and explicitly send zero dummy bytes.
-    alignas(4) uint8_t txChunk[64], rxChunk[64];
+static uint32_t spiClockFor(uint32_t hz) {
+    static uint32_t cachedHz=0,cachedDiv=0; // spiFrequencyToClockDiv is slow
+    if (hz!=cachedHz) { cachedDiv=spiFrequencyToClockDiv(hz); cachedHz=hz; }
+    return cachedDiv;
+}
+static IRAM_ATTR void transfer(Radio &r, const uint8_t *tx, uint8_t *rx, size_t n) {
+    uint64_t start=now();
+    spi_dev_t &spi=SPI3;
+    spi.clock.val=spiClockFor(r.speed);
+    pinWrite(board::cs[r.index],false);
+    ets_delay_us(1);
     for (size_t offset=0;offset<n;offset+=64) {
-        size_t count=std::min(size_t(64),n-offset);
-        memset(txChunk,0,sizeof(txChunk));
-        if (tx) memcpy(txChunk,tx+offset,count);
-        radioSPI.transferBytes(txChunk,rx?rxChunk:nullptr,count);
-        if (rx) memcpy(rx+offset,rxChunk,count);
+        size_t count=std::min(size_t(64),n-offset),words=(count+3)/4;
+        spi.mosi_dlen.usr_mosi_dbitlen=count*8-1;
+        spi.miso_dlen.usr_miso_dbitlen=count*8-1;
+        for (size_t w=0;w<words;++w) {
+            // Dummy bytes while reading a response must be zero (NOP).
+            uint32_t value=0;
+            if (tx) for (size_t k=0;k<4 && 4*w+k<count;++k) value|=uint32_t(tx[offset+4*w+k])<<(8*k);
+            spi.data_buf[w]=value;
+        }
+        spi.cmd.usr=1;
+        while (spi.cmd.usr) {}
+        if (rx) for (size_t w=0;w<words;++w) {
+            uint32_t value=spi.data_buf[w];
+            for (size_t k=0;k<4 && 4*w+k<count;++k) rx[offset+4*w+k]=uint8_t(value>>(8*k));
+        }
     }
-    digitalWrite(board::cs[r.index], HIGH);
-    radioSPI.endTransaction();
-    delayMicroseconds(5);
+    pinWrite(board::cs[r.index],true);
+    if (inAcquire()) { perf.spiUs+=now()-start; ++perf.transfers; }
+    ets_delay_us(5); // Let BUSY assert before the caller polls it.
 }
-static bool readMem(Radio &r, uint32_t address, uint32_t words) {
+static IRAM_ATTR bool readMem(Radio &r, uint32_t address, uint32_t words) {
     uint8_t c[7]={1,6,0,0,0,0,uint8_t(words)};
     be32(c+2,address);
     BusLock lock;
@@ -310,11 +368,11 @@ static bool readMem(Radio &r, uint32_t address, uint32_t words) {
     ++r.readOps;
     return (r.rx[0]>>1)==3;
 }
-static bool word(Radio &r,uint32_t address,uint32_t &value) {
+static IRAM_ATTR bool word(Radio &r,uint32_t address,uint32_t &value) {
     if (!readMem(r,address,1)) return false;
-    value=iq_be32(r.rx+1); return true;
+    value=uint32_t(r.rx[1])<<24|uint32_t(r.rx[2])<<16|uint32_t(r.rx[3])<<8|r.rx[4]; return true;
 }
-static bool masked(Radio &r,uint32_t address,uint32_t mask,uint32_t value) {
+static IRAM_ATTR bool masked(Radio &r,uint32_t address,uint32_t mask,uint32_t value) {
     uint8_t c[14]={1,12}, zero[6]={0}, status[6];
     be32(c+2,address); be32(c+6,mask); be32(c+10,value);
     BusLock lock;
@@ -339,7 +397,7 @@ static bool pointerValid(uint32_t p) {
 }
 static bool validate(Radio &r) {
     uint32_t v;
-    if (!word(r,0xf20124,v) || ((v>>20)&7)!=(r.rate==62500?5u:4u)) return false;
+    if (!word(r,0xf20124,v) || ((v>>20)&7)!=(r.rate==31250?6u:r.rate==62500?5u:4u)) return false;
     if (!word(r,0xf20014,v) || (v&0x30000010)!=0x30000000) return false;
     if (!word(r,IQ_POINTER,v) || v!=0x800a00) return false;
     if(r.packed) {
@@ -395,10 +453,12 @@ static void acquire(void *) {
             if (now()>=r.deadline) r.flags|=IQ_DEADLINE;
             if (r.flags || (r.blocks && r.produced>=r.blocks)) { finishAcquisition(r); continue; }
             uint32_t bank=r.produced%(r.packed?16:IQ_BANKS), desc=iq_descriptor(bank), control;
+            uint64_t pollStart=now();
             if (!word(r,r.packed?0x80f100+bank*4:desc,control)) { r.flags|=IQ_RADIO_ERROR; finishAcquisition(r); continue; }
-            if (r.packed?!(control&0x80000000u):(control&3)!=0) continue;
+            ++perf.polls;
+            if (r.packed?!(control&0x80000000u):(control&3)!=0) { ++perf.pollMisses; perf.pollMissUs+=now()-pollStart; continue; }
             work=true;
-            uint64_t begin=now();
+            uint64_t begin=pollStart;
             uint8_t arcPayload[COMPACT_PAYLOAD_BYTES];
             if(r.packed) {
                 if(!readMem(r,IQ_DATA_BASE+bank*2048,64))r.flags|=IQ_RADIO_ERROR;
@@ -425,6 +485,7 @@ static void acquire(void *) {
             if (r.flags) { finishAcquisition(r); continue; }
             frame.sequence=r.produced; frame.timestamp=uint32_t(now()-r.start);
             frame.samples=IQ_SAMPLES;frame.payloadBytes=IQ_PAYLOAD_BYTES;
+            uint64_t dspStart=now();
             if(r.compact) {
                 uint8_t packed[COMPACT_PAYLOAD_BYTES];
                 if(r.decimated) {
@@ -439,15 +500,42 @@ static void acquire(void *) {
                 if(r.flags) {finishAcquisition(r);continue;}
                 memcpy(frame.bytes+IQ_HEADER_BYTES,packed,frame.payloadBytes);
             }
+            perf.dspUs+=now()-dspStart;
             if (xQueueSend(r.queue,&frame,0)!=pdTRUE) { r.flags|=IQ_QUEUE_FULL; finishAcquisition(r); continue; }
             ++r.produced; r.deadline=now()+1000000;
             r.maxQueue=std::max(r.maxQueue,uint32_t(uxQueueMessagesWaiting(r.queue)));
             r.maxBlock=std::max(r.maxBlock,uint32_t(now()-begin));
+            ++perf.banks; perf.bankUs+=now()-begin; perf.maxBankUs=std::max(perf.maxBankUs,now()-begin);
         }
         // Keep the idle task/watchdog runnable even during indefinite captures.
         // A 1 ms tick fits the 32-bank (32/64 ms) acquisition window.
         if (!work || now()-lastYield>=10000) { vTaskDelay(1); lastYield=now(); }
     }
+}
+// The Arduino lwIP build fixes TCP_SND_BUF at 5760 B (4 segments). On a weak
+// XR4 link a lost segment then rarely draws 3 duplicate ACKs, so recovery waits
+// for the retransmission timer (>= ~0.5 s) and a dual stream's send queue fills
+// (measured: 60 s dual runs ended at 33-46 s at -73 dBm). snd_buf counts free
+// send space; raising it once on an idle connection lets ~12 segments fly.
+// Done inside the tcpip thread; TCP_SND_QUEUELEN (17 pbufs) still caps it.
+struct GrowSend { int fd; SemaphoreHandle_t done; bool ok; };
+static void growSendInTcpip(void *arg) {
+    GrowSend &g=*static_cast<GrowSend *>(arg);
+    struct lwip_sock *sock=lwip_socket_dbg_get_socket(g.fd);
+    if (sock && sock->conn && NETCONNTYPE_GROUP(sock->conn->type)==NETCONN_TCP && sock->conn->pcb.tcp &&
+        sock->conn->pcb.tcp->snd_buf==TCP_SND_BUF) { // Idle: nothing queued.
+        sock->conn->pcb.tcp->snd_buf=TCP_SND_BUF*3;
+        g.ok=true;
+    }
+    xSemaphoreGive(g.done);
+}
+static void growSendBuffer(Radio &r) {
+    if (r.serialSession || r.sendBufferGrown || r.client.fd()<0) return;
+    static StaticSemaphore_t storage;
+    static SemaphoreHandle_t done=xSemaphoreCreateBinaryStatic(&storage);
+    GrowSend g{r.client.fd(),done,false};
+    if (tcpip_callback(growSendInTcpip,&g)==ERR_OK && xSemaphoreTake(done,pdMS_TO_TICKS(100))==pdTRUE)
+        r.sendBufferGrown=g.ok;
 }
 static bool sendBytes(Radio &r,const uint8_t *p,size_t n) {
     uint64_t until=now()+2000000;
@@ -466,8 +554,99 @@ static void hexAppend(String &s,const uint8_t *data,size_t n) {
     const char *digits="0123456789abcdef";
     for (size_t i=0;i<n;++i) { s+=digits[data[i]>>4]; s+=digits[data[i]&15]; }
 }
+// Wait until an absolute esp_timer deadline. Yield to the RTOS while far from
+// the deadline so Wi-Fi and the task watchdog keep running on long gaps; busy-
+// spin the final <3 ms so short OOK edges keep microsecond precision.
+static void ookWaitUntil(uint64_t deadline_us) {
+    for (;;) {
+        uint64_t t=now();
+        if (t>=deadline_us) return;
+        if (deadline_us-t>3000) vTaskDelay(1);
+    }
+}
+static void ookSetup(Radio &r,uint32_t freqHz,uint8_t pa[4],uint8_t power,uint8_t ramp,bool tx) {
+    uint8_t cmd[16],f1,f2;
+    transfer(r,cmd,nullptr,ook_cmd_standby(cmd,1)); ready(r,20);        // XOSC standby
+    if (ook_image_cal_band(freqHz,&f1,&f2)) { transfer(r,cmd,nullptr,ook_cmd_calibrate_image(cmd,f1,f2)); ready(r,50); }
+    transfer(r,cmd,nullptr,ook_cmd_set_frequency(cmd,freqHz)); ready(r,20);
+    transfer(r,cmd,nullptr,ook_cmd_pkt_type(cmd,1)); ready(r,20);        // GFSK base modem
+    if (tx) {
+        transfer(r,cmd,nullptr,ook_cmd_pa_config(cmd,pa)); ready(r,20);
+        transfer(r,cmd,nullptr,ook_cmd_tx_params(cmd,power,ramp)); ready(r,20);
+    }
+    transfer(r,cmd,nullptr,ook_cmd_standby(cmd,1)); ready(r,20);        // carrier guaranteed off
+}
+static void ookTransmit(Radio &r) {
+    request_t &q=r.req;
+    uint8_t cw[4],sb[4];
+    size_t nCw=ook_cmd_tx_cw(cw), nSb=ook_cmd_standby(sb,1);
+    BusLock lock;
+    if (!ready(r,20)) { failure(r,q.id,"busy_timeout","ook_setup"); return; }
+    // Key at the full 16 MHz SPI so a command frame is ~1 µs, not ~32 µs; this
+    // is the edge-timing floor. Restored before returning.
+    uint32_t savedSpeed=r.speed; r.speed=board::stream_spi;
+    ookSetup(r,q.ook_freq_hz,q.ook_pa,q.ook_power,q.ook_ramp,true);
+    uint64_t start=now(),sched=start,maxJit=0;
+    for (uint32_t rep=0;rep<q.ook_repeat;++rep) {
+        for (uint32_t i=0;i<q.ook_pulse_count;++i) {
+            // Even index = carrier on (SetTxCw), odd = off (SetStandby).
+            if (i&1) transfer(r,sb,nullptr,nSb); else transfer(r,cw,nullptr,nCw);
+            uint64_t issued=now(),jit=issued>sched?issued-sched:0;
+            if (jit>maxJit) maxJit=jit;
+            sched+=ook_pulse_at(q.tx,i);
+            ookWaitUntil(sched);
+        }
+        transfer(r,sb,nullptr,nSb);                 // off during the inter-burst gap
+        sched=now()+q.ook_gap_us;
+        ookWaitUntil(sched);
+    }
+    transfer(r,sb,nullptr,nSb); ready(r,20);        // final safety: carrier off
+    r.speed=savedSpeed;
+    r.io->printf("{\"id\":%lu,\"ok\":true,\"mode\":\"ook_tx\",\"freq_hz\":%lu,\"pulses\":%lu,\"repeats\":%lu,\"total_us\":%llu,\"max_edge_jitter_us\":%llu}\n",
+        (unsigned long)q.id,(unsigned long)q.ook_freq_hz,(unsigned long)q.ook_pulse_count,
+        (unsigned long)q.ook_repeat,(unsigned long long)(now()-start),(unsigned long long)maxJit);
+}
+static void ookReceive(Radio &r) {
+    request_t &q=r.req;
+    uint8_t cmd[16],rssi[2];
+    BusLock lock;
+    if (!ready(r,20)) { failure(r,q.id,"busy_timeout","ook_setup"); return; }
+    uint32_t savedSpeed=r.speed; r.speed=board::stream_spi; // fast RSSI polling
+    ookSetup(r,q.ook_freq_hz,q.ook_pa,0,0,false);
+    // Wide GFSK RX filter; the bw code sets the detection bandwidth, the rest
+    // are placeholders the envelope path does not depend on.
+    transfer(r,cmd,nullptr,ook_cmd_gfsk_mod(cmd,4800,0,(uint8_t)q.ook_bw,19000)); ready(r,20);
+    transfer(r,cmd,nullptr,ook_cmd_set_rx(cmd,0xffffff)); ready(r,20);  // continuous RX
+    String out; out.reserve(16384);
+    out="{\"id\":"+String((unsigned long)q.id)+",\"ok\":true,\"mode\":\"ook_rx\",\"freq_hz\":"+
+        String((unsigned long)q.ook_freq_hz)+",\"durations_us\":[";
+    uint64_t start=now(),endt=start+(uint64_t)q.ook_duration_ms*1000,prev=start,lastEdge=start;
+    uint64_t minPoll=UINT64_MAX,maxPoll=0;
+    uint32_t polls=0,edges=0; bool level=false,firstLevel=false,first=true;
+    while (now()<endt && edges<OOK_MAX_EDGES) {
+        transfer(r,cmd,nullptr,ook_cmd_get_rssi(cmd));
+        if (!ready(r,5)) break;
+        transfer(r,nullptr,rssi,2);                 // status + RSSI byte
+        int32_t rssiX2=-(int32_t)rssi[1];           // dBm*2; actual dBm = -rssi/2
+        bool lv=rssiX2>=q.ook_threshold_dbm_x2;      // carrier present above threshold
+        uint64_t t=now(),dp=t-prev; prev=t; ++polls;
+        if (dp<minPoll) minPoll=dp;
+        if (dp>maxPoll) maxPoll=dp;
+        if (first) { level=lv; firstLevel=lv; lastEdge=t; first=false; }
+        else if (lv!=level) { if (edges) out+=","; out+=String((unsigned long)(t-lastEdge)); lastEdge=t; level=lv; ++edges; }
+        if (q.ook_poll_us) ookWaitUntil(t+q.ook_poll_us);
+    }
+    transfer(r,cmd,nullptr,ook_cmd_standby(cmd,1)); ready(r,20);
+    r.speed=savedSpeed;
+    out+="],\"first_level\":"+String(firstLevel?1:0)+",\"edges\":"+String((unsigned long)edges)+
+         ",\"polls\":"+String((unsigned long)polls)+",\"poll_min_us\":"+
+         String((unsigned long)(minPoll==UINT64_MAX?0:minPoll))+",\"poll_max_us\":"+
+         String((unsigned long)maxPoll)+",\"truncated\":"+String(edges>=OOK_MAX_EDGES?"true":"false")+"}\n";
+    r.io->write(reinterpret_cast<const uint8_t *>(out.c_str()),out.length());
+}
 static void stream(Radio &r) {
     request_t &q=r.req;
+    if (otaBusy.load()) { failure(r,q.id,"firmware_update_in_progress","admission"); return; }
     r.packed=q.command==CMD_PACKED;
     if(r.packed && (q.tx_len!=8 || !r.compact || (q.sample_rate!=62500 && q.sample_rate!=125000))) {
         failure(r,q.id,"packed_binding_rate_required","validate");return;
@@ -501,8 +680,9 @@ static void stream(Radio &r) {
     r.sent.store(0);r.elapsed=0;
     r.streamCompact=r.compact;r.streamDecimated=r.decimated;r.streamPacked=r.packed;r.streamRate=r.rate;
     r.start=0; r.stop.store(false); r.done.store(false);
-    r.io->printf("{\"id\":%lu,\"ok\":true,\"stream\":\"%s\",\"format\":\"%s\",\"acquisition\":\"%s\",\"header_bytes\":44,\"samples_per_frame\":%u,\"native_samples_per_frame\":125,\"decimation\":%u,\"blocks\":%lu}\n",
-        (unsigned long)q.id,r.decimated?"LID8":r.compact?"LIQ8":"LIQ1",r.compact?"iq8_block_float":"iq23le",r.packed?"arc8":"raw23",r.decimated?0u:125u,r.decimated?2u:1u,(unsigned long)r.blocks);
+    growSendBuffer(r);
+    r.io->printf("{\"id\":%lu,\"ok\":true,\"stream\":\"%s\",\"format\":\"%s\",\"acquisition\":\"%s\",\"header_bytes\":44,\"samples_per_frame\":%u,\"native_samples_per_frame\":125,\"decimation\":%u,\"blocks\":%lu,\"tcp_send_buffer\":%u}\n",
+        (unsigned long)q.id,r.decimated?"LID8":r.compact?"LIQ8":"LIQ1",r.compact?"iq8_block_float":"iq23le",r.packed?"arc8":"raw23",r.decimated?0u:125u,r.decimated?2u:1u,(unsigned long)r.blocks,r.serialSession?0u:unsigned(TCP_SND_BUF*(r.sendBufferGrown?3:1)));
     r.active.store(true);
     xSemaphoreGive(streamMutex);
     Frame frame;
@@ -573,8 +753,87 @@ static void stream(Radio &r) {
     if (connected && !sendBytes(r,end,sizeof(end))) connected=false;
     if (!connected) r.client.stop();
 }
+static bool hexToBytes(const char *s,uint8_t *out,size_t cap,size_t *n) {
+    size_t len=strlen(s);
+    if ((len&1) || len/2>cap) return false;
+    for (size_t i=0;i<len;++i) {
+        char c=s[i]; int v=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1;
+        if (v<0) return false;
+        if (!(i&1)) out[i/2]=uint8_t(v<<4); else out[i/2]|=uint8_t(v);
+    }
+    *n=len/2; return true;
+}
+static bool parseU32(const char *s,uint32_t lo,uint32_t hi,uint32_t *out) {
+    if (!s || !*s) return false;
+    char *end; unsigned long v=strtoul(s,&end,10);
+    if (*end || v<lo || v>hi) return false;
+    *out=uint32_t(v); return true;
+}
+// ESP32-only OOK commands, parsed ahead of the shared parse_request so the Pico
+// grammar is untouched. ooktx keys a carrier; ookrx recovers an RSSI envelope.
+static bool parseOok(char *line,request_t *req,const char **error) {
+    const char *p=line; char tok[64];
+    if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,1,UINT32_MAX,&req->id)) return false;
+    if (!nextToken(p,tok,sizeof(tok))) return false;
+    bool tx=!strcmp(tok,"ooktx"), rx=!strcmp(tok,"ookrx");
+    if (!tx && !rx) return false;
+    uint32_t id=req->id; memset(req,0,sizeof(*req)); req->id=id;
+    // Full synthesizer span; hardware rejects anything its matching cannot pass.
+    if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,150000000u,2500000000u,&req->ook_freq_hz)) {
+        *error="ook_freq_150M_to_2500M"; return false;
+    }
+    if (tx) {
+        req->command=CMD_OOKTX;
+        char paname[8]; if (!nextToken(p,paname,sizeof(paname))) { *error="ook_pa"; return false; }
+        int pi=ook_pa_index(paname);
+        if (pi<0) { *error="ook_pa_lp_hp_hf"; return false; }
+        const ook_pa_profile_t *prof=ook_pa_profile((unsigned)pi);
+        memcpy(req->ook_pa,prof->config,4);
+        if (!nextToken(p,tok,sizeof(tok))) { *error="ook_power"; return false; }
+        char *end; long power=strtol(tok,&end,10);
+        if (*end || power<prof->min_dbm || power>prof->max_dbm) { *error="ook_power_out_of_pa_range"; return false; }
+        req->ook_power=uint8_t(power&0xff);
+        uint32_t ramp; if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,0,15,&ramp)) { *error="ook_ramp_0_to_15"; return false; }
+        req->ook_ramp=uint8_t(ramp);
+        if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,1,10000,&req->ook_repeat)) { *error="ook_repeat_1_to_10000"; return false; }
+        if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,0,OOK_MAX_PULSE_US,&req->ook_gap_us)) { *error="ook_gap_0_to_32768"; return false; }
+        char pulses[2*OOK_MAX_PULSES+1]; size_t nbytes;
+        if (!nextToken(p,pulses,sizeof(pulses)) || !hexToBytes(pulses,req->tx,BRIDGE_MAX_BYTES,&nbytes) ||
+            (nbytes&1) || nbytes<2) { *error="ook_pulses_hex_be16"; return false; }
+        req->ook_pulse_count=uint32_t(nbytes/2);
+        // Bound total on-air time; reject a pulse of zero or over the ceiling.
+        uint64_t one=0;
+        for (uint32_t i=0;i<req->ook_pulse_count;++i) {
+            uint16_t d=ook_pulse_at(req->tx,i);
+            if (d==0 || d>OOK_MAX_PULSE_US) { *error="ook_pulse_1_to_32768_us"; return false; }
+            one+=d;
+        }
+        if ((one+req->ook_gap_us)*req->ook_repeat>OOK_MAX_TX_TOTAL_US) { *error="ook_total_tx_time_over_2s"; return false; }
+        if (nextToken(p,tok,sizeof(tok))) { *error="ook_trailing_token"; return false; }
+        return true;
+    }
+    req->command=CMD_OOKRX;
+    if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,0,31,&req->ook_bw)) { *error="ook_bw_code_0_to_31"; return false; }
+    if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,1,OOK_MAX_RX_MS,&req->ook_duration_ms)) { *error="ook_duration_1_to_30000_ms"; return false; }
+    if (!nextToken(p,tok,sizeof(tok))) { *error="ook_threshold"; return false; }
+    char *end; long thr=strtol(tok,&end,10);
+    if (*end || thr>0 || thr<-400) { *error="ook_threshold_dbm_x2_-400_to_0"; return false; }
+    req->ook_threshold_dbm_x2=int32_t(thr);
+    if (!nextToken(p,tok,sizeof(tok)) || !parseU32(tok,OOK_MIN_POLL_US,100000,&req->ook_poll_us)) { *error="ook_poll_5_to_100000_us"; return false; }
+    // RX reuses the LP PA slot for setup symmetry; it is not keyed in RX.
+    memcpy(req->ook_pa,ook_pa_profile(0)->config,4);
+    if (nextToken(p,tok,sizeof(tok))) { *error="ook_trailing_token"; return false; }
+    return true;
+}
 static bool parseNomadRequest(char *line,request_t *req,bool *compact,bool *decimated,const char **error) {
     *compact=false;*decimated=false;
+    {
+        unsigned long pid=0; char pcmd[16];
+        if (sscanf(line,"%lu %15s",&pid,pcmd)==2 && (!strcmp(pcmd,"ooktx")||!strcmp(pcmd,"ookrx"))) {
+            *error="ook_syntax";
+            return parseOok(line,req,error);
+        }
+    }
     unsigned long id=0,rate=0,blocks=0;
     char command[16],extra;
     if(sscanf(line,"%lu %15s",&id,command)==2 && (!strcmp(command,"streamp8") || !strcmp(command,"streampd"))) {
@@ -597,9 +856,12 @@ static bool parseNomadRequest(char *line,request_t *req,bool *compact,bool *deci
         if (sscanf(line,"%lu %15s %lu %lu %c",&id,command,&rate,&blocks,&extra)!=4) {
             memset(req,0,sizeof(*req)); req->id=id; *error="stream8_rate_blocks"; return false;
         }
+        // Native narrow rate (LR1121 BW 0x0E): LIQ8 only, no ESP32 FIR stage.
+        bool narrow=rate==31250 && !strcmp(command,"stream8");
         char normalized[96];
-        snprintf(normalized,sizeof(normalized),"%lu stream2 %lu %lu",id,rate,blocks);
+        snprintf(normalized,sizeof(normalized),"%lu stream2 %lu %lu",id,narrow?62500ul:rate,blocks);
         if (!parse_request(normalized,req,error)) return false;
+        if (narrow) req->sample_rate=31250;
         *compact=true;*decimated=!strcmp(command,"streamd");return true;
     }
     return parse_request(line,req,error);
@@ -608,8 +870,8 @@ static void request(Radio &r) {
     request_t &q=r.req;
     switch(q.command) {
     case CMD_INFO:
-        r.io->printf("{\"id\":%lu,\"ok\":true,\"bridge\":\"lr1121-spi\",\"protocol\":1,\"firmware\":\"nomad-0.11.0\",\"board\":\"radiomaster-nomad\",\"radio\":%u,\"radios\":2,\"stream\":\"LIQ1\",\"compact_stream\":\"LIQ8\",\"decimated_stream\":\"LID8\",\"transport\":\"%s\",\"uart_baud\":%lu,\"usb_compact_stream\":true,\"experimental_packed_stream\":true,\"serial_capture_max_blocks\":%u,\"spi_hz\":%lu,\"max_bytes\":4096,\"reset_guard\":0,\"pins\":{\"sck\":25,\"miso\":33,\"mosi\":32,\"cs\":%d,\"busy\":%d,\"reset\":%d,\"dio9\":%d,\"fan\":%d,\"led_rgb\":%d,\"led_count\":%u}}\n",
-            (unsigned long)q.id,r.index,r.serialSession?"uart":"tcp",(unsigned long)board::uart_baud,r.serialSession?32u:0u,(unsigned long)r.speed,board::cs[r.index],board::busy[r.index],board::reset[r.index],board::dio9[r.index],board::fan,board::led,board::led_count); return;
+        r.io->printf("{\"id\":%lu,\"ok\":true,\"bridge\":\"lr1121-spi\",\"protocol\":1,\"firmware\":\"nomad-0.11.0\",\"board\":\"%s\",\"rf_switch\":\"%s\",\"radio\":%u,\"radios\":2,\"stream\":\"LIQ1\",\"compact_stream\":\"LIQ8\",\"decimated_stream\":\"LID8\",\"transport\":\"%s\",\"uart_baud\":%lu,\"usb_compact_stream\":true,\"experimental_packed_stream\":true,\"serial_capture_max_blocks\":%u,\"spi_hz\":%lu,\"max_bytes\":4096,\"reset_guard\":0,\"pins\":{\"sck\":25,\"miso\":33,\"mosi\":32,\"cs\":%d,\"busy\":%d,\"reset\":%d,\"dio9\":%d,\"fan\":%d,\"led_rgb\":%d,\"led_count\":%u}}\n",
+            (unsigned long)q.id,board::name,board::rf_switch,r.index,r.serialSession?"uart":"tcp",(unsigned long)board::uart_baud,r.serialSession?32u:0u,(unsigned long)r.speed,board::cs[r.index],board::busy[r.index],board::reset[r.index],board::dio9[r.index],board::fan,board::led,board::led_count); return;
     case CMD_PINS:
         r.io->printf("{\"id\":%lu,\"ok\":true,\"cs\":%d,\"reset\":%d,\"busy\":%d,\"dio9\":%d}\n",(unsigned long)q.id,
             digitalRead(board::cs[r.index]),digitalRead(board::reset[r.index]),digitalRead(board::busy[r.index]),digitalRead(board::dio9[r.index])); return;
@@ -626,6 +888,8 @@ static void request(Radio &r) {
         if (!ready(r,q.timeout_ms)) { failure(r,q.id,"busy_timeout","wait"); return; }
         break;
     case CMD_STREAM: case CMD_STREAM2: case CMD_PACKED: stream(r); return;
+    case CMD_OOKTX: ookTransmit(r); return;
+    case CMD_OOKRX: ookReceive(r); return;
     case CMD_READ: case CMD_WRITE: case CMD_XFER: {
         String out; out.reserve(2*(q.tx_len+q.read_len)+200);
         uint8_t *cmdRx=static_cast<uint8_t *>(malloc(q.tx_len));
@@ -654,7 +918,7 @@ static void request(Radio &r) {
 static void serve(void *arg) {
     Radio &r=*static_cast<Radio *>(arg);
     for (;;) {
-        r.client=servers[r.index].available();
+        r.client=servers[r.index].available(); r.sendBufferGrown=false;
         if (!r.client) { delay(10); continue; }
         if (xSemaphoreTake(r.owner,0)!=pdTRUE) { r.client.stop(); continue; }
         r.io=&r.client; r.serialSession=false;
@@ -687,48 +951,137 @@ static void serve(void *arg) {
         xSemaphoreGive(r.owner);
     }
 }
+static void otaBegin() {
+#ifdef NOMAD_OTA_PASSWORD
+    // Wi-Fi firmware update (espota, UDP 3232). Compiled in only when a local
+    // password is defined in wifi.local.h; refused while any radio streams.
+    static bool started=false;
+    if (started) return;
+    ArduinoOTA.setHostname(board::hostname);
+    ArduinoOTA.setPassword(NOMAD_OTA_PASSWORD);
+    ArduinoOTA.setMdnsEnabled(false);
+    ArduinoOTA.setRebootOnSuccess(true);
+    ArduinoOTA.onStart([]{ otaBusy.store(true); });
+    ArduinoOTA.onError([](ota_error_t){ otaBusy.store(false); });
+    ArduinoOTA.begin();
+    started=true;
+#endif
+}
+// "<id> fwupdate SIZE MD5HEX" over UART: firmware update with no boot button,
+// usable whenever the app runs (also in safe mode, and when Wi-Fi is down).
+// After the "ready" reply the host sends SIZE raw bytes in 4096-byte chunks and
+// waits for {"offset":N} after each. MD5 is checked before the new slot is made
+// bootable; any failure leaves the running image untouched.
+static bool serialFirmwareUpdate(const char *line) {
+    unsigned long id=0,size=0; char md5[33]={0},extra;
+    if (sscanf(line,"%lu fwupdate %lu %32s %c",&id,&size,md5,&extra)!=3) return false;
+    auto fail=[&](const char *error) {
+        Update.abort();
+        Serial.printf("{\"id\":%lu,\"ok\":false,\"error\":\"%s\",\"phase\":\"fwupdate\"}\n",id,error);
+        return true;
+    };
+    if (radios[0].active.load() || radios[1].active.load()) return fail("streaming");
+    if (strlen(md5)!=32 || !size) return fail("size_md5");
+    if (!Update.begin(size)) return fail(Update.errorString());
+    if (!Update.setMD5(md5)) return fail("md5");
+    Serial.printf("{\"id\":%lu,\"ok\":true,\"ready\":true,\"chunk\":4096}\n",id);
+    static uint8_t chunk[4096];
+    size_t offset=0;
+    while (offset<size) {
+        size_t want=std::min(size_t(size-offset),sizeof(chunk)),got=0;
+        uint64_t deadline=now()+5000000;
+        while (got<want) {
+            size_t n=Serial.read(chunk+got,want-got);
+            if (n) { got+=n; deadline=now()+5000000; }
+            else if (now()>deadline) return fail("timeout");
+            else delay(1);
+        }
+        if (Update.write(chunk,want)!=want) return fail(Update.errorString());
+        offset+=want;
+        Serial.printf("{\"id\":%lu,\"ok\":true,\"offset\":%u}\n",id,unsigned(offset));
+    }
+    if (!Update.end()) return fail(Update.errorString());
+    Serial.printf("{\"id\":%lu,\"ok\":true,\"done\":true,\"rebooting\":true}\n",id);
+    Serial.flush(); delay(100); ESP.restart();
+    return true;
+}
+static bool serialStarted=false, networkStartedOnce=false;
+// A start-up failure must not reboot-loop: that would also take Wi-Fi updates
+// down and force a boot-button reflash. Stay on the network, report why, and
+// keep accepting a fixed image over OTA.
+[[noreturn]] static void safeMode(const char *why) {
+    if (!serialStarted) { Serial.begin(board::uart_baud); serialStarted=true; }
+    if (!networkStartedOnce) { loadWifiCredentials(); startNetwork(); networkStartedOnce=true; }
+    otaBegin();
+    static char line[128]; size_t used=0;
+    for (;;) {
+        Serial.printf("SAFE MODE: %s; free heap %u, largest block %u\n",why,ESP.getFreeHeap(),
+            unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+        for (unsigned i=0;i<100;++i) {
+            while (Serial.available()) { // Accept only fwupdate here.
+                int c=Serial.read();
+                if (c=='\n') { line[used]=0; used=0; serialFirmwareUpdate(line); }
+                else if (c!='\r' && used+1<sizeof(line)) line[used++]=char(c);
+            }
+            networkTick();
+#ifdef NOMAD_OTA_PASSWORD
+            ArduinoOTA.handle();
+#endif
+            delay(10);
+        }
+    }
+}
+#define REQUIRE(condition,why) do { if (!(condition)) safeMode(why); } while (0)
 void setup() {
     // A maximum ASCII SPI command is over 8 KiB. The default 256-byte UART
     // buffer can overflow while loop() updates indicators at 921600 baud.
-    if (Serial.setRxBufferSize(BRIDGE_LINE_SIZE) < BRIDGE_LINE_SIZE) abort();
+    REQUIRE(Serial.setRxBufferSize(BRIDGE_LINE_SIZE) >= BRIDGE_LINE_SIZE,"uart rx buffer");
     // Queue complete IQ frames instead of waiting on the 128-byte hardware
     // FIFO for every write. Per-frame blocking otherwise leaves gaps on TX.
-    if (Serial.setTxBufferSize(4096) < 4096) abort();
-    Serial.begin(board::uart_baud);
+    REQUIRE(Serial.setTxBufferSize(4096) >= 4096,"uart tx buffer");
+    Serial.begin(board::uart_baud); serialStarted=true;
     spiMutex=xSemaphoreCreateMutex();
     streamMutex=xSemaphoreCreateMutex();
-    if (!spiMutex || !streamMutex) abort();
+    REQUIRE(spiMutex && streamMutex,"mutex");
     // Keep the external PA control at zero; hold backpack in reset so its
     // original ELRS auxiliary firmware cannot interfere with this experiment.
-    pinMode(board::pa_apc,OUTPUT); digitalWrite(board::pa_apc,LOW);
-    pinMode(board::backpack_en,OUTPUT); digitalWrite(board::backpack_en,LOW);
+    // Boards without these pins (XR4) use -1; GPIO26 there is radio 0 RESET.
+    if (board::pa_apc>=0) { pinMode(board::pa_apc,OUTPUT); digitalWrite(board::pa_apc,LOW); }
+    if (board::backpack_en>=0) { pinMode(board::backpack_en,OUTPUT); digitalWrite(board::backpack_en,LOW); }
     indicatorsBegin();
     for (unsigned i=0;i<2;++i) {
         Radio &r=radios[i]; r.index=i;
         r.owner=xSemaphoreCreateMutex();
-        if (!r.owner) abort();
+        REQUIRE(r.owner,"radio mutex");
         digitalWrite(board::cs[i],HIGH); pinMode(board::cs[i],OUTPUT);
         digitalWrite(board::reset[i],LOW); pinMode(board::reset[i],OUTPUT);
         pinMode(board::busy[i],INPUT); pinMode(board::dio9[i],INPUT);
         r.queueStorage=static_cast<uint8_t *>(malloc(board::queue_frames*sizeof(Frame)));
-        if(!r.queueStorage)abort();
+        REQUIRE(r.queueStorage,"send queue memory");
         r.queueCapacity=board::queue_frames;
         r.queue=xQueueCreateStatic(board::queue_frames,sizeof(Frame),r.queueStorage,&r.queueControl);
-        if (!r.queue) abort();
+        REQUIRE(r.queue,"send queue");
     }
     radioSPI.begin(board::sck,board::miso,board::mosi,-1);
+    // Sets full duplex, mode 0, MSB first once; transfer() then only writes the clock.
+    radioSPI.beginTransaction(SPISettings(500000,MSBFIRST,SPI_MODE0)); radioSPI.endTransaction();
     for (Radio &r:radios) resetRadio(r);
     loadWifiCredentials();
-    startNetwork();
+    startNetwork(); networkStartedOnce=true;
+    otaBegin(); // Before anything else can fail, so a bad image stays fixable.
     for (unsigned i=0;i<2;++i) {
         servers[i].begin(); servers[i].setNoDelay(true);
-        if (xTaskCreatePinnedToCore(serve,i?"radio1":"radio0",8192,&radios[i],2,nullptr,0)!=pdPASS) abort();
+        REQUIRE(xTaskCreatePinnedToCore(serve,i?"radio1":"radio0",8192,&radios[i],2,nullptr,0)==pdPASS,"serve task");
     }
-    if (xTaskCreatePinnedToCore(acquire,"acquire",4096,nullptr,3,nullptr,1)!=pdPASS) abort();
-    Serial.printf("Nomad SDR: %s mode, TCP 1121 / 1122; use '<id> wifi' for IP/status\n",staEnabled()?"STA":"AP");
+    REQUIRE(xTaskCreatePinnedToCore(acquire,"acquire",4096,nullptr,3,&acquireTask,1)==pdPASS,"acquire task");
+    Serial.printf("%s SDR: %s mode, TCP 1121 / 1122; use '<id> wifi' for IP/status; free heap %u, largest block %u\n",
+        board::name,staEnabled()?"STA":"AP",ESP.getFreeHeap(),unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
 }
 void loop() {
     networkTick();
+#ifdef NOMAD_OTA_PASSWORD
+    if (!radios[0].active.load() && !radios[1].active.load()) ArduinoOTA.handle();
+#endif
     updateIndicators();
     static char consoleLine[BRIDGE_LINE_SIZE];
     static request_t consoleReq;
@@ -747,7 +1100,8 @@ void loop() {
             else if (used) {
                 consoleLine[used]=0;
                 unsigned long id=0; unsigned index=0; char trailing=0;
-                if (networkRequest(consoleLine,Serial,true)) {}
+                if (serialFirmwareUpdate(consoleLine)) {}
+                else if (networkRequest(consoleLine,Serial,true)) {}
                 else if (sscanf(consoleLine,"%lu radio %u %c",&id,&index,&trailing)==2 && id>0 && index<2) {
                     // Selection alone does not issue SPI or reset either chip.
                     selectedRadio=index;
